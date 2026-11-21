@@ -1,0 +1,32 @@
+# Python 运行时产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行数据与下载缓存（运行时生成，勿提交）
+logs/
+runs/
+results/
+uploads/
+pretrained model/
+proxy.json
+
+# 训练 / 推理权重产物
+*.pt
+*.pth
+*.pth.tar
+*.ckpt
+# （随项目内置的离线权重例外：weights/pretrained/ 下的 GhostNetV2 与 P2PNet 检查点）
+!weights/pretrained/*.pth.tar
+!weights/pretrained/p2pnet/*.pth
+
+# 本机环境配置（个人路径，勿分发）
+run_python.txt
+
+# IDE
+.idea/
+.vscode/
+
+# 系统文件
+Thumbs.db
+Desktop.ini

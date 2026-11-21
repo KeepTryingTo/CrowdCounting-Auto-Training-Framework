@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>人群计数自动训练和推理框架</title>
+<script>
+(function () {
+  try {
+    var allowed = ["dark", "light", "midnight", "solarized"];
+    var t = localStorage.getItem("dlatf_theme") || "dark";
+    if (allowed.indexOf(t) < 0) t = "dark";
+    document.documentElement.setAttribute("data-theme", t);
+  } catch (e) { /* ignore */ }
+})();
+</script>
+<link rel="stylesheet" href="/static/css/style.css?v=1.9.1">
+</head>
+<body>
+<script>
+/* 环境自检：file:// 直开或 app.js 加载失败时给出提示（跟随界面语言） */
+(function () {
+  var lang = "zh";
+  try { lang = localStorage.getItem("dlatf_lang") || "zh"; } catch (e) { /* ignore */ }
+  var isEn = lang === "en";
+  function alertBox(msg) {
+    var el = document.createElement("div");
+    el.style.cssText = "position:fixed;top:70px;left:50%;transform:translateX(-50%);" +
+      "background:#7f1d1d;color:#fecaca;padding:14px 28px;border-radius:10px;" +
+      "z-index:99999;font-size:15px;max-width:80vw;text-align:center;line-height:1.8;" +
+      "box-shadow:0 8px 30px rgba(0,0,0,.5)";
+    el.textContent = msg;
+    document.body.appendChild(el);
+  }
+  window.__dlatfEnvCheck = function () {
+    if (!window.__DLATF_READY) {
+      alertBox(isEn
+        ? "Failed to load app.js: press Ctrl+F5 to force refresh; if it persists, stop the service and run run.bat again"
+        : "前端脚本(app.js)加载失败：请按 Ctrl+F5 强制刷新；若仍失败，请关闭服务后重新运行 run.bat");
+    }
+  };
+  window.addEventListener("load", function () {
+    if (location.protocol === "file:") {
+      alertBox(isEn
+        ? "It looks like the HTML file was opened directly (file:// protocol) — the page cannot work! Run run.bat to start the service first, then open http://127.0.0.1:8060"
+        : "检测到直接打开了 HTML 文件（file:// 协议），页面功能无法工作！请先运行 run.bat 启动服务，再用浏览器访问 http://127.0.0.1:8060");
+      return;
+    }
+    setTimeout(window.__dlatfEnvCheck, 1500);
+  });
+})();
+</script>
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <div class="logo-icon">CC</div>
+      <h1 data-i18n="app.title">人群计数自动训练和推理框架</h1>
+    </div>
+    <div class="header-right">
+      <nav class="nav fw-primary" id="fwNav"></nav>
+      <nav class="nav global-nav" id="globalNav">
+        <button class="nav-btn" data-domain="upload" data-i18n="nav.upload">上传和下载数据</button>
+        <button class="nav-btn" data-domain="preprocess" data-i18n="nav.preprocess">数据读取预处理</button>
+        <button class="nav-btn" data-domain="visualize" data-i18n="nav.visualize">可视化</button>
+        <button class="nav-btn" data-domain="hardware" data-i18n="nav.hw">系统状态</button>
+        <button class="nav-btn" data-domain="proxy" data-i18n="nav.proxy">代理设置</button>
+        <button class="nav-btn" data-domain="metrics" data-i18n="nav.metrics">评价指标</button>
+        <button class="nav-btn" data-domain="learning" data-i18n="nav.learning">学习版图</button>
+        <button class="nav-btn" data-domain="author" data-i18n="nav.author">个人主页</button>
+      </nav>
+      <div class="theme-picker">
+        <label for="themeSelect" data-i18n="theme.title">主题</label>
+        <select id="themeSelect" data-i18n-title="theme.title" title="界面主题 / Theme">
+          <option value="dark" data-i18n="theme.dark">深色</option>
+          <option value="light" data-i18n="theme.light">白色</option>
+          <option value="midnight" data-i18n="theme.midnight">午夜蓝</option>
+          <option value="solarized" data-i18n="theme.solarized">暖色</option>
+        </select>
+      </div>
+      <button class="lang-btn" id="langToggle" data-i18n-title="lang.title" title="切换语言 / Switch language">EN</button>
+    </div>
+  </div>
+  <!-- 二级子导航：领域模块 -->
+  <div class="sub-nav-bar">
+    <nav class="nav sub-nav" id="subNav"></nav>
+  </div>
+</header>
+
+<main class="main">
+  <!-- ============ 人群计数（密度图估计 + 点预测） ============ -->
+  <section id="panel-cv" class="panel active">
+    <div class="toolbar">
+      <div class="field">
+        <label data-i18n="cv.taskLabel">具体领域</label>
+        <select id="cvTaskSelect"></select>
+      </div>
+      <div class="task-desc" id="cvTaskDesc"></div>
+      <div class="mode-switch">
+        <button class="mode-btn active" data-mode="train" data-i18n="mode.train">训练模式</button>
+        <button class="mode-btn" data-mode="infer" data-i18n="mode.infer">推理模式</button>
+        <button class="mode-btn" data-mode="deploy" data-i18n="mode.deploy">部署模式</button>
+        <button class="mode-btn" data-mode="test" data-i18n="mode.test">测试模式</button>
+      </div>
+    </div>
+
+    <!-- ---------- 训练 ---------- -->
+    <div id="mode-train" class="mode-panel active">
+      <div class="notice" id="trainUnavailable" style="display:none"
+           data-i18n="train.unavailable">
+        该领域训练功能后续版本提供，当前仅支持推理。
+      </div>
+
+      <div class="cards" id="trainCards">
+        <div class="card">
+          <h3 data-i18n="train.card1">① 模型与设备</h3>
+          <div class="field"><label data-i18n="train.model">网络模型</label>
+            <select id="trainModel"></select></div>
+          <div class="field" id="fieldAnnoFormat" style="display:none">
+            <label data-i18n="train.annoFormat">标注数据读取模式</label>
+            <select id="annotationFormat">
+              <option value="yolo" data-i18n="anno.yolo">YOLO 格式（Labels/*.txt，归一化 cx cy w h）</option>
+              <option value="voc" data-i18n="anno.voc">PASCAL VOC 格式（Labels/*.xml）</option>
+              <option value="csv" data-i18n="anno.csv">CSV 格式（annotations.csv + class_list.csv）</option>
+            </select></div>
+          <div class="field"><label data-i18n="train.runName">运行名称（留空自动生成）</label>
+            <input id="runName" type="text" placeholder="my_first_train"></div>
+          <div class="field"><label data-i18n="train.device">计算设备</label>
+            <select id="trainDevice"></select></div>
+          <div class="field" id="fieldMultiGpu" style="display:none">
+            <label data-i18n="train.multiGpuMode">多 GPU 模式</label>
+            <select id="multiGpuMode">
+              <option value="dp" data-i18n="train.mgDp">DataParallel（单进程多卡）</option>
+              <option value="ddp" data-i18n="train.mgDdp">DDP 分布式（每卡一进程）</option>
+            </select>
+          </div>
+          <div class="field inline">
+            <input id="trainPretrained" type="checkbox" checked>
+            <label for="trainPretrained" data-i18n="train.pretrained">使用预训练权重（ImageNet）</label>
+          </div>
+          <div class="field"><label data-i18n="train.initWeight">初始权重文件（可选：上传的 .pth/.pt，或之前训练产物 best/last）</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="trainInitWeight"><option value="">不使用</option></select>
+              <input id="trainWeightFile" type="file" accept=".pth,.pt,.pth.tar" style="display:none">
+              <button class="btn small" id="btnUploadTrainWeight" style="white-space:nowrap;margin-top:0" data-i18n="train.uploadWeightBtn">上传权重</button>
+            </div>
+            <div class="field inline" style="margin-top:6px">
+              <input id="resumeFromWeight" type="checkbox">
+              <label for="resumeFromWeight" data-i18n="train.resumeMode">续训模式（选中权重作为断点 last 检查点：恢复 epoch/优化器/最优指标，从中断处继续训练；也可选历史训练产物）</label>
+            </div></div>
+        </div>
+
+        <div class="card">
+          <h3 data-i18n="train.card2">② 训练超参数</h3>
+          <div class="grid2">
+            <div class="field"><label>Epochs</label>
+              <input id="epochs" type="number" value="10" min="1"></div>
+            <div class="field"><label>Batch Size</label>
+              <input id="batchSize" type="number" value="2" min="1"></div>
+            <div class="field"><label data-i18n="train.lr">学习率</label>
+              <input id="lr" type="number" value="0.001" step="0.0001"></div>
+            <div class="field"><label data-i18n="train.weightDecay">权重衰减</label>
+              <input id="weightDecay" type="number" value="0" step="0.0001" min="0"></div>
+            <div class="field"><label data-i18n="train.optimizer">优化器</label>
+              <select id="optimizer">
+                <option value="adam">Adam</option>
+                <option value="sgd">SGD</option>
+                <option value="adamw">AdamW</option>
+                <option value="rmsprop">RMSprop</option>
+                <option value="adagrad">Adagrad</option>
+                <option value="adadelta">Adadelta</option>
+                <option value="adamax">Adamax</option>
+                <option value="asgd">ASGD（平均 SGD）</option>
+              </select></div>
+            <div class="field"><label data-i18n="train.momentum">动量（SGD/RMSprop 系）</label>
+              <input id="momentum" type="number" value="0.9" min="0" max="0.999" step="0.01"></div>
+            <div class="field"><label data-i18n="train.scheduler">学习率调度器</label>
+              <select id="scheduler">
+                <option value="step" data-i18n="sched.step">Step 衰减</option>
+                <option value="cosine" data-i18n="sched.cosine">Cosine 退火</option>
+                <option value="multistep" data-i18n="sched.multistep">MultiStep 衰减</option>
+                <option value="poly" data-i18n="sched.poly">Poly 多项式衰减</option>
+                <option value="exponential" data-i18n="sched.exponential">Exponential 衰减</option>
+                <option value="warmup_cosine" data-i18n="sched.warmup_cosine">Warmup + Cosine 退火</option>
+                <option value="warm_restarts" data-i18n="sched.warm_restarts">Cosine 温重启（SGDR）</option>
+                <option value="plateau" data-i18n="sched.plateau">Plateau 自适应</option>
+                <option value="none" data-i18n="sched.none">不使用</option>
+              </select></div>
+            <div class="field" id="fieldWarmupEpochs" style="display:none">
+              <label data-i18n="train.warmupEpochs">Warmup 预热轮数（warmup_cosine）</label>
+              <input id="warmupEpochs" type="number" value="5" min="1"></div>
+            <div class="field" id="fieldT0Epochs" style="display:none">
+              <label data-i18n="train.t0Epochs">温重启初始周期（SGDR）</label>
+              <input id="t0Epochs" type="number" value="10" min="1"></div>
+            <div class="field" id="fieldPolyPower" style="display:none">
+              <label data-i18n="train.polyPower">Poly 衰减幂（poly）</label>
+              <input id="polyPower" type="number" value="0.9" min="0.1" max="2" step="0.1"></div>
+            <div class="field"><label data-i18n="train.loss">损失函数</label>
+              <select id="lossSelect"></select></div>
+            <div class="field" id="fieldLossWeights">
+              <label data-i18n="train.lossWeights">损失权重（默认 = 论文/源码设置）</label>
+              <div class="lw-grid" id="lossWeights"></div>
+            </div>
+            <div class="field" id="fieldImgSize"><label data-i18n="train.cropSize">输入 / 裁剪尺寸（分辨率）</label>
+              <select id="imgSize"></select></div>
+            <div class="field" id="fieldRazStage" style="display:none">
+              <label data-i18n="train.razStage">RAZ 训练阶段</label>
+              <select id="razStage">
+                <option value="all" data-i18n="train.razStage.all">all（density → localization → attention → RAZ）</option>
+                <option value="density" data-i18n="train.razStage.density">density（仅密度分支）</option>
+                <option value="localization" data-i18n="train.razStage.localization">localization（仅定位分支）</option>
+                <option value="attention" data-i18n="train.razStage.attention">attention（仅注意力分支）</option>
+                <option value="raz" data-i18n="train.razStage.raz">raz（仅 RAZ-Net，需要 Main-Net 权重）</option>
+              </select>
+            </div>
+            <div class="field"><label data-i18n="train.workers">DataLoader 进程数</label>
+              <input id="numWorkers" type="number" value="0" min="0"></div>
+            <div class="field"><label data-i18n="train.earlyStop">早停耐心轮数（0=不启用）</label>
+              <input id="earlyStopping" type="number" value="0" min="0"></div>
+            <div class="field"><label data-i18n="train.evalEvery">测试集评估间隔（每 N 个 epoch 评估一次，1=每轮）</label>
+              <input id="evalEvery" type="number" value="1" min="1" max="1000" step="1"></div>
+            <div class="field"><label data-i18n="train.valRatio">验证集比例（无 Test 划分时从训练集切分，0.2=20%）</label>
+              <input id="valRatio" type="number" value="0.2" min="0.02" max="0.9" step="0.01"></div>
+            <div class="field"><label data-i18n="train.seed">随机种子</label>
+              <input id="seed" type="number" value="42"></div>
+            <div class="field inline">
+              <input id="augment" type="checkbox" checked>
+              <label for="augment" data-i18n="train.augmentCrowd">数据增强（多尺度/色彩抖动/裁剪/翻转/噪声/擦除）</label>
+            </div>
+            <div class="field"><label data-i18n="train.augmentStrength">增强强度（0-2，整体缩放各增强幅度）</label>
+              <input id="augmentStrength" type="number" value="1.0" min="0" max="2" step="0.1"></div>
+            <div class="field" id="fieldP2rLabelRatio" style="display:none">
+              <label data-i18n="train.labelRatio">有标注样本比例（半监督点预测，1=全监督）</label>
+              <input id="p2rLabelRatio" type="number" value="1" min="0.01" max="1" step="0.05"></div>
+            <div id="fieldSdgParams" style="display:none">
+              <div class="field" id="fieldSdgBackbone">
+                <label data-i18n="sdg.backbone">骨干网络（单域泛化）</label>
+                <select id="sdgBackbone">
+                  <option value="convNeXt_tiny" selected>convNeXt_tiny</option>
+                  <option value="vgg">vgg16</option>
+                </select></div>
+              <div class="field" id="fieldSdgClusters">
+                <label data-i18n="sdg.clusters">伪域聚类数（DCCUS/LLB 元学习）</label>
+                <input id="sdgNumClusters" type="number" value="4" min="2" max="16" step="1"></div>
+              <div class="field" id="fieldSdgIters">
+                <label data-i18n="sdg.iters">元学习迭代次数/epoch（DCCUS/LLB）</label>
+                <input id="sdgIters" type="number" value="20" min="1" max="5000" step="1"></div>
+              <div class="field" id="fieldSdgTestPatch">
+                <label data-i18n="sdg.testPatch">跨域验证/测试切块窗口（0=整图）</label>
+                <input id="sdgTestPatch" type="number" value="0" min="0" step="64"></div>
+            </div>
+          </div>
+          <p class="hint" id="p2rHint" style="display:none;margin:6px 0 0" data-i18n="train.p2rHint">
+            P2RLoss（CVPR 2025 半监督点预测）：教师-学生 EMA + Point-to-Region 损失。
+            默认超参对齐论文（Adam 5e-5 / 骨干 1e-5 + 恒定学习率 + P2R 损失），
+            界面可调整优化器/学习率/调度器，损失默认 P2R 并支持追加自定义附加损失（契约 aux(pred_density, target_seq)）。
+            「有标注样本比例」&lt;1 时仅该比例图像带标注，其余作为无标注数据参与伪标签训练（种子确定性划分）；
+            标注格式支持 .txt（每行 x y）/ .mat / .npy（(N,2) 坐标，P2RLoss 源格式）。
+          </p>
+          <p class="hint" id="cpHint" style="display:none;margin:6px 0 0" data-i18n="train.cpHint">
+            Consistent-Point（arXiv 2503.12441 半监督点预测）：P2PNet 基座 + PA 位置聚合 + IUC 不确定性校准 + Mean-Teacher。
+            默认超参对齐论文（Adam 1e-4 / 骨干 1e-5 + 恒定学习率 + P2PNet 损失，λ_u=0.1 / K=4 / EMA 0.999），
+            界面可调整优化器/学习率/调度器，损失默认 Consistent-Point 并支持追加自定义附加损失。
+            「有标注样本比例」&lt;1 时仅该比例图像带标注，其余作为无标注数据参与伪标签训练（种子确定性划分）；
+            标注格式支持 .txt（每行 x y）/ .mat / .npy（(N,2) 坐标）。
+          </p>
+          <p class="hint" id="cuHint" style="display:none;margin:6px 0 0" data-i18n="train.cuHint">
+            CU（ICCV 2023 半监督点预测）：P2PNet 基座 + patch 级不确定性分支 + PatchBank ASM 代理真值 + 排序损失 + 课程伪标签过滤 + Mean-Teacher。
+            默认超参对齐论文（Adam 1e-4 / 骨干 1e-5 + 恒定学习率 + P2PNet 损失，λ₁=0.3 / patch=64 / u_max=0.5 / EMA 0.999），
+            界面可调整优化器/学习率/调度器，损失默认 CU 并支持追加自定义附加损失。
+            「有标注样本比例」&lt;1 时仅该比例图像带标注，其余作为无标注数据参与伪标签训练（种子确定性划分）；
+            标注格式支持 .txt（每行 x y）/ .mat / .npy（(N,2) 坐标）。
+          </p>
+          <div id="fieldYoloAug" style="display:none">
+            <p class="hint" style="margin:6px 0 8px" data-i18n="train.yoloHint">
+              YOLO 系列（ultralytics 引擎）：优化器 / 调度器 / 损失由引擎托管，
+              以下增强参数与「数据增强」开关生效（增强强度整体缩放）。
+            </p>
+            <div class="grid2">
+              <div class="field"><label data-i18n="train.yoloMosaic">Mosaic 概率（YOLO）</label>
+                <input id="yoloMosaic" type="number" value="1.0" min="0" max="1" step="0.05"></div>
+              <div class="field"><label data-i18n="train.yoloScale">Scale 缩放幅度（YOLO）</label>
+                <input id="yoloScale" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+              <div class="field"><label data-i18n="train.yoloMixup">Mixup 概率（YOLO）</label>
+                <input id="yoloMixup" type="number" value="0" min="0" max="1" step="0.05"></div>
+              <div class="field"><label data-i18n="train.yoloCopyPaste">Copy-Paste 概率（YOLO）</label>
+                <input id="yoloCopyPaste" type="number" value="0.1" min="0" max="1" step="0.05"></div>
+            </div>
+          </div>
+          <div id="fieldYoloDistill" style="display:none">
+            <p class="hint" style="margin:6px 0 8px" data-i18n="train.yoloDistillHint">
+              知识蒸馏：以大模型（教师）的中间特征为软目标训练小模型（学生），
+              在参数量更少的情况下保持性能。教师优先选同数据集训练产物（类别一致）；
+              官方 COCO 教师亦可（特征与得分加权与类别数无关，引擎投影层自动对齐通道差异）。
+              师生需同为 3 尺度 Detect 头的 YOLO 系列（RT-DETR / YOLOv6 暂不支持）。
+            </p>
+            <div class="field inline">
+              <input id="yoloDistill" type="checkbox">
+              <label for="yoloDistill" data-i18n="train.distillEnable">启用知识蒸馏（教师 → 学生）</label>
+            </div>
+            <div class="grid2">
+              <div class="field"><label data-i18n="train.distillTeacherWeight">教师权重文件（推荐：同数据集训练产物）</label>
+                <select id="distillTeacherWeight"></select></div>
+              <div class="field"><label data-i18n="train.distillTeacherModel">教师模型（官方 COCO 预训练，自动下载）</label>
+                <select id="distillTeacherModel"></select></div>
+              <div class="field"><label data-i18n="train.distillLambda">蒸馏损失权重（dis，0=关闭蒸馏项）</label>
+                <input id="distillLambda" type="number" value="6" min="0" step="0.5"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 data-i18n="train.card3">③ 数据集</h3>
+          <p class="hint" id="datasetHint" data-i18n="ds.crowd_density">
+            密度图路线数据集：根目录含 Train/Test 子目录，各含 Images/（图像）与
+            GT/（*.npy 密度图 或 *.txt 点标注，每行 "x y"）；.mat 点标注请先用下方工具
+            转换为 .npy；兼容 imgs/ + gt/npys/ 扁平结构。上传 zip 后自动解压。
+          </p>
+          <div class="field"><label data-i18n="train.uploadDataset">上传数据集 (zip)</label>
+            <input id="datasetFile" type="file" accept=".zip">
+            <button class="btn small" id="btnUploadDataset" data-i18n="train.uploadDatasetBtn">上传数据集</button></div>
+          <div class="field"><label data-i18n="train.selectDataset">或选择已上传数据集</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="datasetSelect"><option value="">— 请选择 —</option></select>
+              <button class="btn small danger" id="btnDeleteDataset" data-i18n="train.deleteDataset" disabled style="white-space:nowrap;margin-top:0">删除数据集</button>
+            </div></div>
+          <div class="field"><label data-i18n="train.datasetPath">或输入服务器路径</label>
+            <input id="datasetPath" type="text" placeholder="D:\datasets\SHHA"></div>
+          <div class="field" id="fieldTargetDataset" style="display:none">
+            <label data-i18n="sdg.targetDataset">目标数据集（跨域验证，可选）</label>
+            <select id="targetDatasetSelect"><option value="">— 不指定（仅源域） —</option></select>
+            <p class="hint" data-i18n="sdg.targetHint">
+              单域泛化在源域训练、目标域测试；目标集仅用于每轮跨域 MAE 评估与最优模型选择，不参与训练。
+            </p></div>
+          <div class="dataset-stats" id="datasetStats"></div>
+        </div>
+
+        <div class="card wide">
+          <h3 data-i18n="train.card4">④ 开始训练</h3>
+          <div class="actions">
+            <button class="btn primary" id="btnStartTrain" data-i18n="train.start">开始训练</button>
+            <button class="btn danger" id="btnStopTrain" disabled data-i18n="train.stop">停止训练</button>
+          </div>
+          <div class="train-status">
+            <div class="status-line" id="trainStatus" data-i18n="train.notStarted">尚未开始训练</div>
+            <div class="progress"><div class="progress-bar" id="trainProgress"></div></div>
+            <div class="metrics" id="trainMetrics"></div>
+            <div class="chart" id="trainChart"></div>
+            <pre class="log" id="trainLog"></pre>
+          </div>
+          <h4 style="margin-top:14px" data-i18n="train.history">历史任务</h4>
+          <div style="margin-bottom:6px">
+            <button class="btn small" onclick="refreshTaskHistory()">刷新列表</button>
+            <button class="btn small" onclick="refreshTaskLog()">刷新日志</button>
+          </div>
+          <table class="table" id="taskHistoryTable">
+            <thead><tr><th data-i18n="history.task">任务</th><th data-i18n="history.type">类型</th>
+              <th data-i18n="history.status">状态</th><th data-i18n="history.progress">进度</th>
+              <th data-i18n="history.best">最优指标</th><th data-i18n="history.weight">权重</th>
+              <th data-i18n="history.action">操作</th></tr></thead>
+            <tbody id="taskHistoryBody"></tbody>
+          </table>
+
+          <h4 style="margin-top:18px" data-i18n="train.restoreTitle">恢复中断训练（上传运行目录 zip）</h4>
+          <p class="hint" data-i18n="train.restoreHint">
+            将中断前的运行目录（含 params.json / last.pth / metrics.csv 等训练产物）打包为 zip
+            上传，恢复为历史任务后点击「继续训练」，按原参数与断点状态续训
+            （原数据集路径仍需存在于本机）。</p>
+          <div class="field"><label data-i18n="train.restoreFile">运行目录 zip</label>
+            <input id="trainRunZipFile" type="file" accept=".zip">
+            <button class="btn small" id="btnUploadTrainRun" data-i18n="train.restoreBtn">上传恢复</button></div>
+          <div class="status-line" id="trainRestoreStatus"></div>
+        </div>
+
+        <!-- 单域泛化专属：仅测试（跨域泛化性能评估，不训练） -->
+        <div class="card wide" id="sdgTestCard" style="display:none">
+          <h3 data-i18n="sdg.testCard">⑤ 单域泛化 · 测试（仅评估跨域 MAE / MSE）</h3>
+          <p class="hint" data-i18n="sdg.testHint">
+            加载训练权重（建议 best.pth），在另一个领域的测试集上仅评估泛化性能：
+            输出 MAE / MSE 与逐图结果（runs/sdg_test/&lt;名称&gt;/test_results.csv）。
+            模型结构优先按权重内记录的 sdg_meta 自动重建。
+          </p>
+          <div class="grid2">
+            <div class="field"><label data-i18n="sdg.testWeight">训练产物权重</label>
+              <select id="sdgTestWeight"><option value="">— 请选择权重 —</option></select></div>
+            <div class="field"><label data-i18n="sdg.testDataset">测试数据集（其它领域）</label>
+              <select id="sdgTestDataset"><option value="">— 请选择数据集 —</option></select></div>
+            <div class="field"><label data-i18n="sdg.testPatchOnly">切块窗口（0=整图）</label>
+              <input id="sdgTestPatchOnly" type="number" value="0" min="0" step="64"></div>
+          </div>
+          <div class="actions">
+            <button class="btn primary" id="btnSdgTest" data-i18n="sdg.testRun">开始测试</button>
+          </div>
+          <div class="status-line" id="sdgTestStatus"></div>
+          <div class="metrics" id="sdgTestResult"></div>
+          <pre class="log" id="sdgTestLog"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- 推理 ---------- -->
+    <div id="mode-infer" class="mode-panel">
+      <div class="cards">
+        <div class="card">
+          <h3 data-i18n="infer.card1">① 输入图像</h3>
+          <div class="dropzone" id="dropzone">
+            <div class="dz-text" data-i18n-html="infer.dropzone">拖拽图片到此处（可多选批量）<br>或点击选择文件</div>
+            <input type="file" id="inferImage" accept="image/*" multiple hidden>
+          </div>
+          <div class="preview" id="imagePreview"></div>
+          <div class="field" style="margin-top:10px">
+            <label data-i18n="infer.folder">??????????????</label>
+            <input id="inferFolder" type="file" accept="image/*" multiple webkitdirectory directory>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 data-i18n="infer.card2">② 模型与权重</h3>
+          <div class="infer-mode-hint" id="inferModeHint"></div>
+          <div class="field"><label data-i18n="infer.model">网络模型</label>
+            <select id="inferModel"></select></div>
+          <div class="field inline" id="inferPretrainedBox">
+            <input id="inferPretrained" type="checkbox">
+            <label for="inferPretrained" data-i18n="infer.pretrainedCrowd">使用内置预训练模型（ImageNet 骨干 / P2PNet SHTechA 检查点）</label>
+          </div>
+          <div class="field"><label data-i18n="infer.trainedWeight">或选择训练产物权重</label>
+            <select id="inferWeightSelect"><option value="">不使用</option></select></div>
+          <div class="field"><label data-i18n="infer.uploadWeight">或上传权重文件（.pth / .onnx）</label>
+            <input id="inferWeightFile" type="file" accept=".pth,.pt,.pth.tar,.onnx">
+            <button class="btn small" id="btnUploadWeight" data-i18n="infer.uploadWeightBtn">上传权重</button></div>
+          <div class="field"><label data-i18n="infer.device">计算设备</label>
+            <select id="inferDevice"></select></div>
+          <div class="grid2">
+            <div class="field" id="fieldConf"><label data-i18n="infer.conf">点置信度阈值（P2PNet）</label>
+              <input id="confThreshold" type="number" value="0.5" step="0.05" min="0" max="1"></div>
+          </div>
+          <div class="field inline">
+            <input id="saveResult" type="checkbox">
+            <label for="saveResult" data-i18n="infer.save">保存预测结果到服务器</label>
+          </div>
+          <div class="field">
+            <label data-i18n="infer.saveDir">可视化保存目录（服务器路径，留空自动生成）</label>
+            <input id="inferSaveDir" type="text" placeholder="D:\results\infer 或 runs/infer/demo">
+          </div>
+          <div class="actions">
+            <button class="btn primary" id="btnInfer" data-i18n="infer.start">开始推理</button>
+            <button class="btn" id="btnCameraDetect" data-i18n="camera.open">摄像头实时计数</button>
+          </div>
+        </div>
+
+        <div class="card wide">
+          <h3 data-i18n="infer.card3">③ 推理结果</h3>
+          <div id="inferResult" class="infer-result">
+            <p class="hint" data-i18n="infer.hint">上传图片并点击「开始推理」后，结果将显示在这里。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- 部署（ONNX 导出） ---------- -->
+    <div id="mode-deploy" class="mode-panel">
+      <p class="hint" style="margin:0 0 10px" data-i18n="deploy.hint">
+        ONNX 部署导出：将训练产物导出为 ONNX 中间表示（可部署到 ONNX Runtime /
+        TensorRT / OpenVINO 等运行时），并自动生成与模型类型匹配的部署推理片段代码 ——
+        复制片段 + model.onnx 到部署设备即可运行，无需本框架与 PyTorch。
+      </p>
+      <div class="cards">
+        <div class="card">
+          <h3 data-i18n="deploy.card1">① 选择权重（自动识别模型类型）</h3>
+          <div class="field"><label data-i18n="deploy.weight">权重文件（训练产物 / 上传）</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="deployWeightSelect"></select>
+              <input id="deployWeightFile" type="file" accept=".pth,.pt,.pth.tar" style="display:none">
+              <button class="btn small" id="btnDeployUploadWeight" style="white-space:nowrap;margin-top:0" data-i18n="infer.uploadWeightBtn">上传权重</button>
+            </div></div>
+          <div id="deployFormatInfo" class="infer-mode-hint" style="display:none"></div>
+          <p class="hint" data-i18n="deploy.fmtHint">
+            权重格式由独立推断模块识别：训练产物同目录 params.json → ultralytics 检查点 →
+            state_dict 架构指纹（密度网 / P2PNet / Consistent-Point / P2R）。
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 data-i18n="deploy.card2">② 导出参数</h3>
+          <div class="grid2">
+            <div class="field"><label data-i18n="deploy.imgsz">输入边长（0=按模型默认）</label>
+              <input id="deployImgsz" type="number" value="0" min="0" step="32"></div>
+            <div class="field"><label data-i18n="deploy.opset">ONNX opset 版本</label>
+              <input id="deployOpset" type="number" value="13" min="9" max="19"></div>
+            <div class="field inline">
+              <input id="deployDynamic" type="checkbox">
+              <label for="deployDynamic" data-i18n="deploy.dynamic">动态 batch（YOLO 同时放开空间维）</label>
+            </div>
+            <div class="field inline">
+              <input id="deploySimplify" type="checkbox" checked>
+              <label for="deploySimplify" data-i18n="deploy.simplify">onnxslim 图简化</label>
+            </div>
+            <div class="field inline" id="fieldDeployHalf" style="display:none">
+              <input id="deployHalf" type="checkbox">
+              <label for="deployHalf" data-i18n="deploy.half">FP16（仅 YOLO，CUDA 导出生效）</label>
+            </div>
+            <div class="field inline" id="fieldDeployNms" style="display:none">
+              <input id="deployNms" type="checkbox">
+              <label for="deployNms" data-i18n="deploy.nms">NMS 内嵌 ONNX（YOLO 端到端，免后处理）</label>
+            </div>
+            <div class="field"><label data-i18n="deploy.confThr">片段代码置信度阈值</label>
+              <input id="deployConfThr" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+          </div>
+          <div class="actions">
+            <button class="btn primary" id="btnOnnxExport" data-i18n="deploy.start">导出 ONNX + 部署代码</button>
+          </div>
+        </div>
+
+        <div class="card wide">
+          <h3 data-i18n="deploy.card3">③ 导出结果（下载 + 片段代码）</h3>
+          <div id="deployResult">
+            <p class="hint" data-i18n="deploy.resultHint">导出完成后：model.onnx 下载链接 + 按模型类型生成的部署推理片段代码（可一键复制）。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- 独立测试（算法 + 权重 + 数据集 + patch） ---------- -->
+    <div id="mode-test" class="mode-panel">
+      <p class="hint" style="margin:0 0 10px" data-i18n="test.hint">
+        测试模式只做推理评估，不更新权重：选择算法、训练产物或上传权重、数据集和切块窗口，
+        输出测试日志、逐图结果以及 MAE / RMSE。
+      </p>
+      <div class="cards">
+        <div class="card">
+          <h3 data-i18n="test.card1">① 算法与权重</h3>
+          <div class="field"><label data-i18n="test.task">测试路线</label>
+            <select id="testTaskSelect"></select></div>
+          <div class="field"><label data-i18n="test.model">测试算法 / 模型</label>
+            <select id="testModel"></select></div>
+          <div class="field"><label data-i18n="test.weight">权重（训练产物或上传）</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="testWeightSelect"></select>
+              <input id="testWeightFile" type="file" accept=".pth,.pt,.pth.tar" style="display:none">
+              <button class="btn small" id="btnUploadTestWeight" style="white-space:nowrap;margin-top:0"
+                      data-i18n="test.uploadWeightBtn">上传权重</button>
+            </div></div>
+          <p class="hint" data-i18n="test.weightHint">
+            权重可直接选训练产物（best/last），也可先上传 .pth/.pt；模型结构会按权重内记录的信息或当前算法重建。
+          </p>
+        </div>
+
+        <div class="card">
+          <h3 data-i18n="test.card2">② 数据集与切块</h3>
+          <div class="field"><label data-i18n="test.dataset">测试数据集</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="testDatasetSelect"></select>
+              <input id="testDatasetPath" type="text" placeholder="或输入数据集绝对路径">
+            </div></div>
+          <div class="grid2">
+            <div class="field"><label data-i18n="test.patch">切块 patch（0=整图）</label>
+              <input id="testPatch" type="number" value="0" min="0" step="64"></div>
+            <div class="field"><label data-i18n="test.split">数据划分</label>
+              <select id="testSplit">
+                <option value="test" data-i18n="test.splitTest">Test / Val</option>
+                <option value="train" data-i18n="test.splitTrain">Train</option>
+              </select></div>
+            <div class="field"><label data-i18n="test.device">计算设备</label>
+              <select id="testDevice"></select></div>
+          </div>
+          <p class="hint" data-i18n="test.patchHint">
+            切块用于密度图 / 单域泛化测试（切块窗口，0 表示整图）；点预测模型按整图推理，patch 会被忽略。
+          </p>
+        </div>
+
+        <div class="card wide">
+          <h3 data-i18n="test.card3">③ 测试执行与结果</h3>
+          <div class="actions">
+            <button class="btn primary" id="btnRunTest" data-i18n="test.run">开始测试</button>
+            <button class="btn danger" id="btnStopTest" disabled data-i18n="test.stop">停止测试</button>
+          </div>
+          <div class="status-line" id="testStatus" data-i18n="test.notStarted">尚未开始测试</div>
+          <div class="progress"><div class="progress-bar" id="testProgress"></div></div>
+          <div class="metrics" id="testMetrics"></div>
+          <pre class="log" id="testLog"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 系统状态（硬件监控） ============ -->
+  <section id="panel-hardware" class="panel">
+    <div class="toolbar">
+      <div class="field inline" style="margin:0">
+        <input id="hwLive" type="checkbox" checked>
+        <label for="hwLive" data-i18n="hw.live">实时刷新</label>
+      </div>
+      <div class="field" style="margin:0;min-width:120px">
+        <label data-i18n="hw.interval">刷新间隔</label>
+        <select id="hwInterval">
+          <option value="1000">1s</option>
+          <option value="2000" selected>2s</option>
+          <option value="5000">5s</option>
+        </select>
+      </div>
+      <div class="task-desc" data-i18n="hw.desc">实时硬件状态：CPU / 内存 / GPU / 磁盘 / 网络</div>
+      <button class="btn small" id="btnHwRefreshNow" style="margin-top:0"
+              data-i18n="hw.refreshNow">立即刷新</button>
+    </div>
+    <div id="hwContent">
+      <p class="hint"><span class="loading"></span></p>
+    </div>
+
+    <h3 style="margin:22px 0 10px" data-i18n="blog.title">后台日志（实时）</h3>
+    <div class="toolbar">
+      <div class="field" style="margin:0;min-width:110px">
+        <label data-i18n="blog.stream">信息类型</label>
+        <select id="blogStream">
+          <option value="all" data-i18n="blog.all">全部</option>
+          <option value="out" data-i18n="blog.out">标准输出</option>
+          <option value="err" data-i18n="blog.err">错误 / 警告</option>
+        </select>
+      </div>
+      <div class="field" style="margin:0;min-width:150px">
+        <label data-i18n="blog.filter">内容过滤</label>
+        <input id="blogFilter" type="text" placeholder="keyword">
+      </div>
+      <div class="field inline" style="margin:0">
+        <input id="blogFollow" type="checkbox" checked>
+        <label for="blogFollow" data-i18n="blog.follow">自动滚动</label>
+      </div>
+      <button class="btn small" id="btnBlogRefresh" onclick="loadBackendLogs()"
+              style="margin-top:0">刷新日志</button>
+      <button class="btn small" id="btnBlogClear" style="margin-top:0"
+              data-i18n="blog.clear">清空</button>
+      <button class="btn small" id="btnBlogDownload" style="margin-top:0"
+              data-i18n="blog.download">下载日志</button>
+      <span style="font-size:11px;color:var(--text-dim);margin-left:4px">每 10 秒自动刷新 | 上次更新: <span id="blogLastUpdate">—</span></span>
+    </div>
+    <pre class="log" id="backendLogBox" style="max-height:420px"></pre>
+  </section>
+
+  <!-- ============ 上传和下载数据（独立模块） ============ -->
+  <section id="panel-upload" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="upload.desc">
+        上传 zip 压缩包或从 URL 下载数据集（均保存到服务器同一目录，
+        解压后自动统计图像与 GT 标注数量），
+        可直接在「人群计数 → 训练模式」的数据集下拉框中选用；
+        同名数据集重复上传/下载会覆盖（被运行中任务占用的会被拒绝）。
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3 data-i18n="upload.card1">① 上传数据集 (zip)</h3>
+        <div class="dropzone" id="uploadDropzone">
+          <div class="dz-text" data-i18n-html="upload.dropzone">拖拽 zip 数据集到此处<br>或点击选择文件</div>
+          <input type="file" id="uploadZipFile" accept=".zip" hidden>
+        </div>
+        <div class="hint" style="margin:10px 0 0" data-i18n="upload.postHint">
+          上传常用数据集（ShanghaiTech / QNRF / NWPU / UCF_CC_50）自动统一为 Train/Images+GT；
+          自定义数据集已按统一格式打包则直接可用，无需任何转换。
+        </div>
+        <div class="field inline" style="margin-top:10px">
+          <input id="upConvertTxt" type="checkbox" checked>
+          <label for="upConvertTxt" data-i18n="upload.convertTxt">标注统一转换为 .txt（取消则保留原始 .mat / .txt 格式，目录与文件主名仍统一为 GT/&lt;图像主名&gt;）</label>
+        </div>
+        <div class="field inline" style="margin-top:10px">
+          <input id="upMatToNpy" type="checkbox">
+          <label for="upMatToNpy" data-i18n="upload.matToNpy">GT 点标注 → .npy 密度图（仅删除成功生成 .npy 的源 .txt / .mat；转换失败/无配对图像的标注保留；仅供密度图路线训练）</label>
+        </div>
+        <div class="grid2" id="upNpyParams" style="display:none">
+          <div class="field"><label data-i18n="upload.npySigma">高斯 sigma（密度图生成，默认 2）</label>
+            <input id="upMatSigma" type="number" value="2" min="0.5" step="0.5"></div>
+          <div class="field inline" style="align-self:end">
+            <input id="upMatAdaptive" type="checkbox">
+            <label for="upMatAdaptive" data-i18n="mat.adaptive">k 近邻自适应 sigma（MCNN 风格）</label>
+          </div>
+        </div>
+        <div class="field inline">
+          <input id="upVisPng" type="checkbox">
+          <label for="upVisPng" data-i18n="upload.visPng">转换同时将密度图可视化为 .png（后台任务，完成后自动刷新列表）</label>
+        </div>
+        <div class="field" id="upVisDirField" style="display:none">
+          <label data-i18n="upload.visDir">PNG 保存目录（留空 → &lt;数据集&gt;/vis_png/Train|Test）</label>
+          <input id="upVisDir" type="text" placeholder="D:\datasets\SHHA_png" autocomplete="off">
+        </div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn primary" id="btnUploadDs" data-i18n="upload.btn">上传数据集</button>
+        </div>
+        <div class="status-line" id="uploadStatus"></div>
+        <div class="progress" id="uploadProgressWrap" style="display:none">
+          <div class="progress-bar" id="uploadProgressBar"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 data-i18n="upload.cardDownload">② 下载数据集 (URL)</h3>
+        <div class="field">
+          <label data-i18n="upload.presetLink">预设数据集下载链接（点击选用）</label>
+          <select id="dlPresetLink"><option value="">— 选择常用数据集 —</option></select>
+        </div>
+        <div class="field">
+          <label data-i18n="upload.dlUrl">或输入数据集下载链接 (zip 直链)</label>
+          <input id="dlUrl" type="text" placeholder="https://example.com/dataset.zip" autocomplete="off">
+        </div>
+        <div class="field">
+          <label data-i18n="upload.dlName">数据集名称（留空自动从 URL 推断）</label>
+          <input id="dlName" type="text" placeholder="my_dataset">
+        </div>
+        <div class="hint" id="dlPresetInfo" style="display:none"></div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn primary" id="btnDownloadDs" data-i18n="upload.dlBtn">下载数据集</button>
+        </div>
+        <div class="status-line" id="dlStatus"></div>
+        <div class="progress" id="dlProgressWrap" style="display:none">
+          <div class="progress-bar" id="dlProgressBar"></div>
+        </div>
+      </div>
+
+      <div class="card wide" id="dlTreeCard" style="display:none">
+        <h3 data-i18n="upload.treeTitle">所选数据集的目录格式要求（原始布局）</h3>
+        <pre class="log" id="dlTree" style="max-height:240px"></pre>
+        <h3 data-i18n="upload.convTitle" style="margin-top:12px">下载 / 上传解压后将自动转换的统一格式</h3>
+        <pre class="log" id="dlUnifiedTree" style="max-height:200px"></pre>
+        <p class="hint" style="margin:8px 0 0" data-i18n="upload.convNote">
+          按上方原始格式打包 zip 后下载或上传，程序探测到常用数据集布局即自动转换
+          （GT → .txt 点标注，密度图 / 点预测两条路线通用）；已是统一格式或自定义数据集则保持原样。
+        </p>
+      </div>
+
+      <div class="card wide">
+        <h3 data-i18n="upload.card2">③ 已上传数据集</h3>
+        <div style="margin-bottom:6px">
+          <button class="btn small" id="btnDsRefresh" data-i18n="upload.refresh">刷新列表</button>
+        </div>
+        <table class="table" id="dsTable">
+          <thead><tr>
+            <th data-i18n="upload.th.name">名称</th>
+            <th data-i18n="upload.th.images">图像</th>
+            <th data-i18n="upload.th.gt">GT 标注（.txt / .npy / .mat）</th>
+            <th data-i18n="upload.th.path">服务器路径</th>
+            <th data-i18n="upload.th.action">操作</th>
+          </tr></thead>
+          <tbody id="dsTableBody">
+            <tr><td colspan="5" style="color:var(--text-dim)">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card wide" id="dsStructureCard">
+        <h3 data-i18n="upload.structTitle">④ 数据集结构浏览（逐级展开）</h3>
+        <div class="actions" style="margin-bottom:8px;flex-wrap:wrap;gap:8px;align-items:center">
+          <select id="dsTreeSelect" style="min-width:260px"></select>
+          <button class="btn small" id="btnDsTreeRefresh" data-i18n="upload.structRefresh">刷新</button>
+          <button class="btn small" id="btnDsTreeCollapse" data-i18n="upload.structCollapse">全部收起</button>
+        </div>
+        <div class="ds-tree" id="dsTreeView">
+          <div class="ds-tree-empty" data-i18n="upload.structEmpty">请选择数据集查看结构</div>
+        </div>
+      </div>
+
+      <div class="card wide" id="matTool">
+        <h3 data-i18n="upload.cardTools">⑤ GT 密度图转换与可视化工具（.mat → .npy → .png）</h3>
+        <p class="hint" data-i18n="upload.toolsHint">
+          对已上传 / 本机任意目录的标注做手动转换（上传时未勾选自动转换、或下载数据集后补转换时使用）：
+          第一步 .mat 点标注 → .npy 密度图（自动探测 ShanghaiTech image_info 与 annPoints 两种格式，
+          标签带任意前缀均可配对）；第二步 .npy 密度图 → .png 可视化（热力图 / 灰度 / 原图叠加）。
+        </p>
+        <h4 style="margin:14px 0 8px;color:var(--accent2)" data-i18n="mat.title">GT 密度图转换工具（.mat → .npy）</h4>
+        <div class="grid2">
+          <div class="field"><label data-i18n="mat.dir">.mat 文件目录</label>
+            <input id="matDir" type="text" placeholder="D:\datasets\SHHA\train_data\mats"></div>
+          <div class="field"><label data-i18n="mat.imgDir">图像目录（可选，默认自动定位）</label>
+            <input id="matImgDir" type="text" placeholder="D:\datasets\SHHA\train_data\images"></div>
+          <div class="field"><label data-i18n="mat.saveDir">密度图保存目录</label>
+            <input id="matSaveDir" type="text" placeholder="D:\datasets\SHHA\train\GT"></div>
+          <div class="field"><label data-i18n="mat.sigma">高斯 sigma（框架默认 2）</label>
+            <input id="matSigma" type="number" value="2" min="0.5" step="0.5"></div>
+        </div>
+        <div class="field inline">
+          <input id="matAdaptive" type="checkbox">
+          <label for="matAdaptive" data-i18n="mat.adaptive">k 近邻自适应 sigma（MCNN 风格）</label>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btnMat2Density" data-i18n="mat.convert">开始转换</button>
+        </div>
+        <div class="status-line" id="matToolStatus"></div>
+
+        <h4 style="margin:18px 0 8px;color:var(--accent2)" data-i18n="npyvis.title">密度图可视化工具（.npy → .png）</h4>
+        <div class="grid2">
+          <div class="field"><label data-i18n="npyvis.dir">.npy 文件目录</label>
+            <input id="npyVisDir" type="text" placeholder="D:\datasets\SHHA\test_data\temp"></div>
+          <div class="field"><label data-i18n="npyvis.saveDir">PNG 保存目录（留空 → runs/npy2png）</label>
+            <input id="npyVisSaveDir" type="text" placeholder="D:\datasets\SHHA\test_data\temp_png"></div>
+          <div class="field"><label data-i18n="npyvis.mode">着色方式</label>
+            <select id="npyVisMode">
+              <option value="heat" data-i18n="npyvis.heat">伪彩色热力图（jet）</option>
+              <option value="gray" data-i18n="npyvis.gray">灰度</option>
+              <option value="overlay" data-i18n="npyvis.overlay">叠加融合（密度热力图 × 原图）</option>
+            </select></div>
+          <div class="field" id="npyVisAlphaField" style="display:none">
+            <label data-i18n="npyvis.alpha">融合比例——密度权重（0=纯原图，1=纯热力图）</label>
+            <input id="npyVisAlpha" type="number" value="0.67" min="0" max="1" step="0.05"></div>
+          <div class="field" id="npyVisImgDirField" style="display:none">
+            <label data-i18n="npyvis.imgDir">原图目录（叠加模式必填，按 .npy 主名定位）</label>
+            <input id="npyVisImgDir" type="text" placeholder="D:\datasets\SHHA\test_data\imgs"></div>
+          <div class="field inline" style="align-self:end">
+            <input id="npyVisAnnotate" type="checkbox" checked>
+            <label for="npyVisAnnotate" data-i18n="npyvis.annotate">标注 count≈总和</label>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btnNpyVis" data-i18n="npyvis.btn">开始可视化</button>
+        </div>
+        <div class="status-line" id="npyVisStatus"></div>
+      </div>
+    </div>
+    <p class="hint" data-i18n="upload.format" style="padding:0 4px">
+      数据集格式：根目录含 Train/ 与 Test/ 子目录，各含 Images/（图像）与 GT/
+      （.npy 密度图、.txt 点标注，P2PNet 另支持 ShanghaiTech .mat）；
+      兼容 imgs/ + gt/npys/ 扁平结构。.mat 点标注可先用训练卡片的
+      「.mat → GT 密度图工具」转换为 .npy。
+    </p>
+  </section>
+
+  <!-- ============ 数据读取预处理（独立模块） ============ -->
+  <section id="panel-preprocess" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="preprocess.desc">
+        将常用人群计数数据集（JHU-CROWD++ / NWPU / UCF-QNRF / ShanghaiTech A,B / UCF_CC_50 / 自定义）
+        统一转换为 YOLO 头部框格式（train/test × images/labels + data.yaml）。
+        含框标注的数据集直接提取；纯点标注数据集可通过 k 近邻自适应推框或 YOLO 检测模型生成头部框。
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3 data-i18n="preprocess.card1">① 选择数据集</h3>
+        <div class="field">
+          <label data-i18n="preprocess.preset">数据集类型</label>
+          <select id="ppPreset"></select>
+        </div>
+        <div class="field">
+          <label data-i18n="preprocess.source">数据集来源（已上传数据集名 / 服务器路径）</label>
+          <select id="ppDatasetSelect"><option value="">— 请选择已上传数据集 —</option></select>
+        </div>
+        <div class="field">
+          <label data-i18n="preprocess.path">或输入服务器路径</label>
+          <input id="ppDatasetPath" type="text" placeholder="D:\datasets\jhu_crowd_v2.0">
+        </div>
+        <div class="dataset-stats" id="ppDatasetStats"></div>
+      </div>
+
+      <div class="card">
+        <h3 data-i18n="preprocess.card2">② 无框标注策略</h3>
+        <div class="field">
+          <label data-i18n="preprocess.boxSource">头部框获取方式（仅对纯点标注数据集生效）</label>
+          <select id="ppBoxSource">
+            <option value="adaptive" data-i18n="preprocess.bs.adaptive">k 近邻自适应推框（推荐）</option>
+            <option value="yolo_detect" data-i18n="preprocess.bs.yolo">YOLO 检测模型生成框</option>
+            <option value="skip" data-i18n="preprocess.bs.skip">跳过无框标注样本</option>
+          </select>
+          <p class="hint" data-i18n="preprocess.bsHint">自带 GT 框标注的数据集（如 JHU-CROWD）直接读取框并转换为训练结构，不生成、不跳过；本选项只影响缺少框标注的样本。</p>
+        </div>
+        <div id="ppAdaptiveParams">
+          <div class="grid2">
+            <div class="field"><label data-i18n="preprocess.k">k 近邻数</label>
+              <input id="ppAdaptiveK" type="number" value="4" min="1" max="20"></div>
+            <div class="field"><label data-i18n="preprocess.scale">缩放系数</label>
+              <input id="ppAdaptiveScale" type="number" value="0.4" min="0.1" max="2" step="0.05"></div>
+            <div class="field"><label data-i18n="preprocess.defaultSize">默认框边长（点数不足时）</label>
+              <input id="ppAdaptiveDefault" type="number" value="20" min="4"></div>
+          </div>
+        </div>
+        <div id="ppYoloParams" style="display:none">
+          <div class="field"><label data-i18n="preprocess.yoloWeight">YOLO 权重（训练产物 .pt）</label>
+            <select id="ppYoloWeight"><option value="">— 请选择 —</option></select></div>
+          <div class="field"><label data-i18n="preprocess.yoloConf">置信度阈值</label>
+            <input id="ppYoloConf" type="number" value="0.25" min="0.01" max="1" step="0.05"></div>
+        </div>
+        <div class="field">
+          <label data-i18n="preprocess.saveDir">输出目录（留空 → 数据集同级目录/&lt;数据集名&gt;_box）</label>
+          <input id="ppSaveDir" type="text" placeholder="留空 → D:\datasets\jhu_crowd_v2.0_box">
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btnPreprocess" data-i18n="preprocess.start">开始预处理</button>
+        </div>
+        <div class="status-line" id="ppStatus"></div>
+        <div class="progress" id="ppProgressWrap" style="display:none">
+          <div class="progress-bar" id="ppProgressBar"></div>
+        </div>
+        <pre class="log" id="ppLog" style="max-height:200px;display:none"></pre>
+      </div>
+    </div>
+    <div class="card wide" id="ppTreeCard" style="display:none">
+      <h3 data-i18n="preprocess.treeTitle">所选数据集的目录格式要求</h3>
+      <pre class="log" id="ppTree" style="max-height:260px"></pre>
+    </div>
+  </section>
+
+  <!-- ============ 可视化（独立模块） ============ -->
+  <section id="panel-visualize" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="vis.desc">
+        对图像进行可视化：支持「模型推理可视化」（用模型对图像推理并生成叠加图）
+        和「标签可视化」（用标注文件直接生成叠加图，无需模型）。
+        标签格式按路线选择：密度图 → .npy、点预测 → .mat、头部框 → .txt(YOLO) / .xml(VOC)。
+        支持单张图像或目录批量处理。
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3 data-i18n="vis.card1">① 模式与路线</h3>
+        <div class="field">
+          <label data-i18n="vis.mode">可视化模式</label>
+          <select id="visMode">
+            <option value="label" data-i18n="vis.mode.label">标签可视化（用标注文件生成叠加图）</option>
+            <option value="model" data-i18n="vis.mode.model">模型推理可视化（用模型推理生成叠加图）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label data-i18n="vis.route">技术路线</label>
+          <select id="visRoute">
+            <option value="crowd_density" data-i18n="vis.route.density">密度图（标签：.npy）</option>
+            <option value="crowd_point" data-i18n="vis.route.point">点预测（标签：.mat）</option>
+            <option value="crowd_box" data-i18n="vis.route.box">头部框（标签：.txt YOLO / .xml VOC）</option>
+          </select>
+        </div>
+        <div class="field" id="visLabelFormatField" style="display:none">
+          <label data-i18n="vis.labelFormat">标签格式（头部框路线）</label>
+          <select id="visLabelFormat">
+            <option value="yolo_txt">YOLO .txt（cls cx cy w h 归一化）</option>
+            <option value="voc_xml">VOC .xml</option>
+          </select>
+        </div>
+        <div class="field" id="visDeviceField" style="display:none">
+          <label data-i18n="vis.device">计算设备</label>
+          <select id="visDevice"></select>
+        </div>
+        <div class="field" id="visConfField" style="display:none">
+          <label data-i18n="vis.conf">点/框置信度阈值（点预测与头部框路线）</label>
+          <input id="visConf" type="number" value="0.5" step="0.05" min="0" max="1">
+        </div>
+      </div>
+
+      <div class="card" id="visSingleCard">
+        <h3 data-i18n="vis.card2">② 单张图像</h3>
+        <div class="field">
+          <label data-i18n="vis.image">选择图像</label>
+          <input id="visImageFile" type="file" accept="image/*">
+        </div>
+        <div class="field" id="visLabelFileField">
+          <label data-i18n="vis.labelFile">上传标签文件（.npy / .mat / .txt / .xml）</label>
+          <input id="visLabelFile" type="file" accept=".npy,.mat,.txt,.xml">
+        </div>
+        <div class="field" id="visModelField" style="display:none">
+          <label data-i18n="vis.model">选择模型</label>
+          <select id="visModel"><option value="">— 请选择 —</option></select>
+        </div>
+        <div class="field" id="visWeightField" style="display:none">
+          <label data-i18n="vis.weight">选择权重（训练产物 / 上传）</label>
+          <select id="visWeight"><option value="">不使用</option></select>
+        </div>
+        <div class="field inline">
+          <input id="visSaveSingle" type="checkbox">
+          <label for="visSaveSingle" data-i18n="vis.saveResult">保存可视化结果</label>
+        </div>
+        <div class="field">
+          <label data-i18n="vis.singleSaveDir">保存目录（服务器路径，留空自动生成）</label>
+          <input id="visSingleSaveDir" type="text" placeholder="D:\results\vis 或 runs/visualize/demo">
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btnVisSingle" data-i18n="vis.singleBtn">开始可视化</button>
+        </div>
+        <div class="status-line" id="visSingleStatus"></div>
+      </div>
+
+      <div class="card">
+        <h3 data-i18n="vis.card3">③ 批量可视化（目录）</h3>
+        <div class="field">
+          <label data-i18n="vis.imageDir">图像目录（服务器路径 / 已上传数据集名）</label>
+          <input id="visImageDir" type="text" placeholder="D:\datasets\my_ds\Train\Images">
+        </div>
+        <div class="field">
+          <label data-i18n="vis.folder">或选择本地图像文件夹（模型可视化，批量上传）</label>
+          <input id="visFolderFiles" type="file" accept="image/*" multiple webkitdirectory directory>
+        </div>
+        <div class="field" id="visLabelDirField">
+          <label data-i18n="vis.labelDir">标签目录（服务器路径）</label>
+          <input id="visLabelDir" type="text" placeholder="D:\datasets\my_ds\Train\GT">
+        </div>
+        <div class="field inline">
+          <input id="visSaveBatch" type="checkbox" checked>
+          <label for="visSaveBatch" data-i18n="vis.saveResult">保存可视化结果</label>
+        </div>
+        <div class="field">
+          <label data-i18n="vis.saveDir">保存目录（留空 → runs/visualize/）</label>
+          <input id="visSaveDir" type="text" placeholder="D:\datasets\vis_output">
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btnVisBatch" data-i18n="vis.batchBtn">开始批量可视化</button>
+        </div>
+        <div class="status-line" id="visBatchStatus"></div>
+        <div class="progress" id="visProgressWrap" style="display:none">
+          <div class="progress-bar" id="visProgressBar"></div>
+        </div>
+        <pre class="log" id="visLog" style="max-height:150px;display:none"></pre>
+      </div>
+
+      <div class="card wide" id="visResultCard" style="display:none">
+        <h3 data-i18n="vis.result">可视化结果</h3>
+        <div id="visResultGallery" class="infer-result"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 代理设置（独立模块） ============ -->
+  <section id="panel-proxy" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="proxy.desc">
+        为预训练模型下载（torchvision / VGG16_bn / ResNet-IBN 权重）配置 HTTP(S)/SOCKS5 代理。输入代理地址后点击「添加」进入列表；按 Tab 键自动补全默认代理；勾选「启用代理」立即生效，取消勾选立即恢复直连。配置保存在 proxy.json，重启服务后自动应用，训练与推理的后台任务均生效。
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3 data-i18n="proxy.addTitle">① 添加代理</h3>
+        <div class="field">
+          <label data-i18n="proxy.url">代理地址（http / https / socks5）</label>
+          <div class="proxy-input-row">
+            <input id="proxyUrlInput" type="text"
+                   placeholder="http://127.0.0.1:7890" autocomplete="off">
+            <button class="btn small primary" id="btnProxyAdd"
+                    data-i18n="proxy.add" style="margin-top:0">添加</button>
+          </div>
+        </div>
+        <div class="hint" id="proxyInputHint"></div>
+      </div>
+      <div class="card">
+        <h3 data-i18n="proxy.listTitle">② 代理列表与启用</h3>
+        <div id="proxyList" class="proxy-list"></div>
+        <div class="field inline" style="margin-top:12px">
+          <input id="proxyEnabled" type="checkbox">
+          <label for="proxyEnabled" data-i18n="proxy.enabled">启用代理（勾选立即生效，取消恢复直连）</label>
+        </div>
+        <div class="field">
+          <label data-i18n="proxy.testUrl">测试地址</label>
+          <input id="proxyTestUrl" type="text" placeholder="https://download.pytorch.org">
+        </div>
+        <div class="actions" style="display:flex;gap:10px;align-items:center">
+          <button class="btn small danger" id="btnProxyClearAll"
+                  data-i18n="proxy.clear" style="margin-top:0">清除全部配置</button>
+        </div>
+        <div class="task-desc" id="proxyStatus" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 评价指标可视化 ============ -->
+  <section id="panel-metrics" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="mv.desc">
+        人群计数训练与推理中用到的评价指标：每张卡片附计算公式、通俗解释与可交互示例。
+        拖动滑块 / 点击控件观察数值变化，直观理解各指标的含义与差异。
+      </div>
+    </div>
+    <div id="metricsPanelBody"></div>
+  </section>
+
+  <!-- ============ 学习版图 ============ -->
+  <section id="panel-learning" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="learning.desc">人群计数领域常用数据集下载与参考链接：数据集附简介（适用领域与规模），点击卡片直达下载页 / 参考项目仓库 / 教程</div>
+    </div>
+    <div id="learningMap" class="learning-map"></div>
+  </section>
+
+  <!-- ============ 个人主页 ============ -->
+  <section id="panel-author" class="panel">
+    <div class="toolbar">
+      <div class="task-desc" data-i18n="author.desc">
+        作者的内容分享渠道：技术博客、视频空间、开源项目与短视频，点击「前往主页」直达对应平台。
+      </div>
+    </div>
+    <div class="author-grid">
+      <div class="author-card ac-csdn">
+        <div class="author-emoji">✍️</div>
+        <h3 data-i18n="author.csdn.name">CSDN 博客</h3>
+        <p class="author-note" data-i18n="author.csdn.desc">
+          技术博客：深度学习、人群计数与嵌入式方向的原创笔记、项目实战与问题排查记录。
+        </p>
+        <div class="author-tags">
+          <span data-i18n="author.tag.dl">深度学习</span>
+          <span data-i18n="author.tag.practice">项目实战</span>
+          <span data-i18n="author.tag.notes">学习笔记</span>
+        </div>
+        <a class="btn small author-visit" href="https://blog.csdn.net/Keep_Trying_Go"
+           target="_blank" rel="noopener" data-i18n="author.visit">前往主页 →</a>
+        <div class="author-url">blog.csdn.net/Keep_Trying_Go</div>
+      </div>
+      <div class="author-card ac-bili">
+        <div class="author-emoji">📺</div>
+        <h3 data-i18n="author.bilibili.name">哔哩哔哩</h3>
+        <p class="author-note" data-i18n="author.bilibili.desc">
+          视频空间：框架使用教程、训练与推理演示、项目实录与踩坑分享。
+        </p>
+        <div class="author-tags">
+          <span data-i18n="author.tag.video">视频教程</span>
+          <span data-i18n="author.tag.demo">项目演示</span>
+        </div>
+        <a class="btn small author-visit" href="https://space.bilibili.com/625095571"
+           target="_blank" rel="noopener" data-i18n="author.visit">前往主页 →</a>
+        <div class="author-url">space.bilibili.com/625095571</div>
+      </div>
+      <div class="author-card ac-github">
+        <div class="author-emoji">🐙</div>
+        <h3 data-i18n="author.github.name">GitHub</h3>
+        <p class="author-note" data-i18n="author.github.desc">
+          开源主页：本框架源码与更多深度学习相关项目。
+        </p>
+        <div class="author-tags">
+          <span data-i18n="author.tag.opensource">开源项目</span>
+          <span data-i18n="author.tag.framework">本框架源码</span>
+        </div>
+        <a class="btn small author-visit" href="https://github.com/KeepTryingTo"
+           target="_blank" rel="noopener" data-i18n="author.visit">前往主页 →</a>
+        <div class="author-url">github.com/KeepTryingTo</div>
+      </div>
+      <div class="author-card ac-douyin">
+        <div class="author-emoji">🎶</div>
+        <h3 data-i18n="author.douyin.name">抖音</h3>
+        <p class="author-note" data-i18n="author.douyin.desc">
+          短视频：碎片化的技术分享与日常更新。
+        </p>
+        <div class="author-tags">
+          <span data-i18n="author.tag.shortvideo">短视频</span>
+          <span data-i18n="author.tag.techshare">技术分享</span>
+        </div>
+        <a class="btn small author-visit" href="https://www.douyin.com/user/self?from_tab_name=main&amp;showTab=post"
+           target="_blank" rel="noopener" data-i18n="author.visit">前往主页 →</a>
+        <div class="author-url">douyin.com · 作者主页</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <span data-i18n="footer.text">人群计数自动训练和推理框架 · FastAPI · PyTorch · 密度图估计 + 点预测（P2PNet） ·</span>
+  <span id="footerInfo"></span>
+</footer>
+
+<!-- ============ 摄像头实时计数弹窗 ============ -->
+<div id="cameraModal" class="cam-modal" hidden>
+  <div class="cam-modal-box">
+    <div class="cam-modal-head">
+      <h3 id="cameraModalTitle" data-i18n="camera.title">摄像头实时计数</h3>
+      <span class="cam-modal-sub" id="cameraModalSub"></span>
+      <button class="cam-close" id="btnCameraClose" title="Close">×</button>
+    </div>
+    <div class="cam-modal-body">
+      <div class="cam-controls">
+        <div class="field"><label data-i18n="camera.index">摄像头编号</label>
+          <input id="camIndex" type="number" value="0" min="0" max="9" style="width:90px"></div>
+        <div class="field"><label data-i18n="camera.resolution">分辨率</label>
+          <select id="camResolution" style="width:150px">
+            <option value="">Default</option>
+            <option value="640x480">640 × 480</option>
+            <option value="1280x720">1280 × 720</option>
+            <option value="1920x1080">1920 × 1080</option>
+          </select></div>
+        <button class="btn primary" id="btnCameraStart" data-i18n="camera.start">开启检测</button>
+        <button class="btn" id="btnCameraStop" data-i18n="camera.stop">停止</button>
+      </div>
+      <div class="status-line" id="cameraStatus"></div>
+      <div class="cam-stream-wrap" id="cameraStreamWrap">
+        <img id="cameraStreamImg" alt="camera stream">
+        <div class="cam-placeholder" id="cameraPlaceholder"
+             data-i18n="camera.placeholder">点击「开启检测」后，实时画面将显示在这里</div>
+      </div>
+      <p class="hint" data-i18n="camera.hint">
+        画面左上角实时显示平均 FPS 与人群数量统计：密度图估计→人群数量（密度求和）、
+        P2PNet 点预测→人群数量（置信点计数）。</p>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/i18n.js?v=1.9.0"></script>
+<script src="/static/js/app.js?v=1.9.0"></script>
+</body>
+</html>

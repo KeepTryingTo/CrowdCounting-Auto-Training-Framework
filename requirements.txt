@@ -1,0 +1,23 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+torch>=1.11.0
+torchvision>=0.12.0
+pillow>=9.0.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+opencv-python>=4.5.0
+# launcher 环境检查必需项
+tqdm>=4.64.0
+# 人群计数（密度 GT 高斯滤波 / .mat 转换 / P2PNet 匈牙利匹配）
+scipy>=1.7.0
+# 系统状态监控（CPU / 内存 / 磁盘 / 网络）；未安装时仅显示 GPU 与系统信息
+psutil>=5.9.0
+# 头部框路线（crowd_box）：YOLO 系列训练与推理引擎；未安装时该路线不可用，其余不受影响
+ultralytics>=8.2.0
+# ONNX 导出 / 部署（导出校验 + onnxruntime 运行验证 + 图简化）
+onnx>=1.13.0
+onnxruntime>=1.15.0
+onnxslim>=0.1.0
+# 代理连通性测试（socks5 代理需要；HTTP(S) 代理可不用）
+# pysocks>=1.7.1
