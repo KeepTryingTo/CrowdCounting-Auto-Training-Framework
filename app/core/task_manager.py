@@ -78,6 +78,13 @@ def _release_task_memory(task=None):
        推理会因此 OOM。
     长驻服务进程 + 反复训练的场景，收尾释放是防止内存水位逐任务爬升的关键。
     """
+    try:
+        from app.services.train_common import release_training_memory
+        release_training_memory(task.log if task is not None else None,
+                                reason="任务收尾")
+        return
+    except Exception:
+        pass
     import gc
     gc.collect()
     try:
@@ -151,6 +158,9 @@ class Task:
                 frac = float(self.epoch) / float(self.total_epochs)
             if frac > 0:
                 eta_seconds = max(0.0, elapsed_seconds * (1.0 - frac) / frac)
+        total_seconds = (elapsed_seconds + eta_seconds
+                         if elapsed_seconds is not None
+                         and eta_seconds is not None else None)
         return {
             "id": self.id, "name": self.name, "kind": self.kind,
             "status": self.status, "progress": round(self.progress, 1),
@@ -161,6 +171,8 @@ class Task:
                                 if elapsed_seconds is not None else None),
             "eta_seconds": (round(eta_seconds, 1)
                             if eta_seconds is not None else None),
+            "estimated_total_seconds": (round(total_seconds, 1)
+                                        if total_seconds is not None else None),
             "metrics": self.metrics, "history": self.history,
             "live_history": getattr(self, "live_history", [])[-600:],
             "best": self.best, "error": self.error,
@@ -226,6 +238,29 @@ def _best_from_history(history):
         best = (max if mode == "max" else min)(vals, key=lambda h: h[key])
         return {"epoch": best["epoch"], key: best[key]}
     return {}
+
+
+def _prepare_for_training(task):
+    """训练开始前让出资源：清推理模型缓存 + 停摄像头实时检测。
+
+    训练是长驻服务的内存/CPU 峰值场景：LRU 推理缓存（P2PNet 级可达 GB）
+    与逐帧摄像头推理会与训练争内存/CPU，轻则拖慢、重则让训练在原生层
+    OOM 崩溃。摄像头会话可由用户训练结束后重新开启。
+    """
+    try:
+        from app.services.crowd_counting import clear_inference_cache
+        n = clear_inference_cache()
+        if n:
+            task.log(f"训练前已清空推理模型缓存（{n} 个），为训练让出内存")
+    except Exception:
+        pass
+    try:
+        from app.services import camera_service
+        if camera_service.manager.get() is not None:
+            camera_service.manager.stop()
+            task.log("训练前已停止摄像头实时检测，为训练让出 CPU/内存")
+    except Exception:
+        pass
 
 
 class TaskManager:
@@ -312,6 +347,7 @@ class TaskManager:
             task.started_ts = time.time()
             task.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             task.status = "running"
+            _prepare_for_training(task)
             target_fn(task, *args)
             if task.stop_event.is_set():
                 self._finish_task(task, "stopped")

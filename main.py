@@ -3,6 +3,7 @@
 
 启动: python main.py  →  http://127.0.0.1:8060
 """
+import faulthandler
 import json
 import shutil
 import sys
@@ -19,6 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
+# 原生崩溃（Windows access violation 0xC0000005）时把各线程 Python 栈
+# 写入 stderr（launcher 会收集到 server_console.log），便于定位内存/OOM。
+faulthandler.enable(all_threads=True)
+
 from config import (STATIC_DIR, RESULTS_DIR, UPLOAD_DATASET_DIR,
                     UPLOAD_MODEL_DIR, WEIGHT_EXTS, IMAGE_EXTS, CUSTOM_MODELS_DIR)
 from app.core.backend_log import install as install_backend_log
@@ -31,6 +36,13 @@ _init_proxy()
 # 缓存目录环境变量须在 torch import 前设置（import 时固化）
 from app.core.model_cache import init as _init_model_cache
 _init_model_cache()
+
+# 旧版 torch（如 YOLOv3 环境的 torch 1.12）不支持 torch.load(weights_only=...)：
+# 必须在任何路由/服务模块 import 前打补丁（幂等，新版 torch 自动跳过）
+from app.core.torch_compat import TORCH_LOAD_WEIGHTS_ONLY_PATCHED as _wc_patched
+if _wc_patched:
+    print("[compat] 当前 torch 不支持 torch.load(weights_only=...)，"
+          "已启用兼容补丁")
 
 _available_routers = []
 
@@ -317,6 +329,53 @@ async def upload_dataset(file: UploadFile = File(...),
             "unified": unified, "unified_log": unified_log,
             "convert_txt": bool(convert_txt),
             "post_task_id": post_task_id}
+
+
+@app.post("/api/upload/dataset/{name}/convert")
+def convert_upload_dataset(name: str, body: dict = None):
+    """对已上传数据集直接执行标注格式转换（后台任务）。
+
+    支持：点标注 → .txt、点标注 → .npy 密度图、.npy → .png 可视化。
+    """
+    if not name or "/" in name or "\\" in name or ".." in name or \
+            name.startswith("_tmp"):
+        raise HTTPException(400, f"无效的数据集名称: {name}")
+    target = (UPLOAD_DATASET_DIR / name).resolve()
+    if target.parent != UPLOAD_DATASET_DIR.resolve():
+        raise HTTPException(400, f"无效的数据集名称（越界）: {name}")
+    if not target.is_dir():
+        raise HTTPException(404, f"数据集不存在: {name}")
+    _ensure_dataset_not_in_use(target)
+
+    body = body or {}
+    to_npy = bool(body.get("to_npy"))
+    to_txt = bool(body.get("to_txt"))
+    vis_png = bool(body.get("vis_png"))
+    if to_npy and to_txt:
+        raise HTTPException(400, "请只选择一种标注格式（.txt 或 .npy）")
+    if not (to_npy or to_txt or vis_png):
+        raise HTTPException(400, "请至少选择一种转换或可视化操作")
+    output_format = "npy" if to_npy else ("txt" if to_txt else "")
+    sigma = float(body.get("sigma") or 2.0)
+    adaptive = bool(body.get("adaptive"))
+    vis_dir = (body.get("vis_dir") or "").strip()
+
+    from app.core.task_manager import task_manager
+    from app.services.dataset_unify import run_dataset_convert
+    from config import RUNS_DIR
+    sd = RUNS_DIR / "upload_post" / f"{name}_convert"
+    if sd.exists():
+        sd = RUNS_DIR / "upload_post" / (
+            f"{name}_convert_{uuid.uuid4().hex[:4]}")
+    sd.mkdir(parents=True, exist_ok=True)
+    params = {"dataset_dir": str(target), "output_format": output_format,
+              "sigma": sigma, "adaptive": adaptive,
+              "vis_png": vis_png, "vis_dir": vis_dir}
+    (sd / "params.json").write_text(
+        json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+    task = task_manager.create(f"dataset_convert_{name}", "postprocess", sd)
+    task_manager.submit(task, run_dataset_convert, params)
+    return {"ok": True, "dataset": name, "task_id": task.id}
 
 
 @app.delete("/api/upload/dataset/{name}")

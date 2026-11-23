@@ -28,6 +28,10 @@ import numpy as np
 import torch
 from torch import nn
 
+# 旧版 torch（<2.0）不支持 torch.load(weights_only=...)：独立运行本模块时
+# 也要生效（通过 main 启动时已由 main 打过补丁，幂等）
+from app.core.torch_compat import TORCH_LOAD_WEIGHTS_ONLY_PATCHED  # noqa: F401
+
 from app.services import weight_format
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]

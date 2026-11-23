@@ -598,7 +598,8 @@ def run_cltr_train(task, params: dict):
 # ------------------------- 推理 -------------------------
 
 def cltr_infer(image: Image.Image, weight_path=None, device="cpu",
-               pretrained=True, conf_threshold=None):
+               pretrained=True, conf_threshold=None,
+               return_all_points=False):
     """CLTR 推理：整图 256 分块，按 score 阈值取点并可视化。"""
     import base64
     import io
@@ -649,6 +650,8 @@ def cltr_infer(image: Image.Image, weight_path=None, device="cpu",
             "num_points": int(len(pts_xy)),
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in pts_xy[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in pts_xy]} if return_all_points else {}),
             "conf_threshold": threshold, "model": "cltr",
             "point_based": True}
 

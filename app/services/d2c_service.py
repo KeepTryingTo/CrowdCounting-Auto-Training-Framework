@@ -77,7 +77,8 @@ def _make_args(params: dict, save_dir: Path) -> SimpleNamespace:
 def run_d2c_train(task, params: dict):
     """Training entry for D2CNet on the crowd-point route."""
     from app.services.crowd_counting import clear_inference_cache
-    from app.services.train_common import save_loss_curves
+    from app.services.train_common import (release_training_memory,
+                                           save_loss_curves)
 
     device = get_device(str(params.get("device") or "cpu"))
     params = dict(params)
@@ -186,6 +187,8 @@ def run_d2c_train(task, params: dict):
             best = score
             task.best = {"epoch": epoch, "val_mae": round(score, 4)}
             save_checkpoint(best_path, pmr, cmr, args, epoch, best)
+        # 每轮收尾及时回收：gc + CUDA 缓存显存归还（PMR/CMR 双骨干常驻）
+        release_training_memory(task.log, reason=f"epoch {epoch} 收尾")
     if not best_path.exists():
         save_checkpoint(best_path, pmr, cmr, args, args.epochs, best)
     try:
@@ -229,7 +232,8 @@ def _to_b64(img: np.ndarray, rgb: bool = True) -> str:
 
 
 def d2c_infer(image: Image.Image, weight_path=None, device="cpu",
-              pretrained=False, conf_threshold=0.5, max_side=1920):
+              pretrained=False, conf_threshold=0.5, max_side=1920,
+              return_all_points=False):
     """Single-image D2C inference (PMR + CMR + LCG-PPD)."""
     if not weight_path:
         raise ValueError("D2C 推理需要训练产物权重（d2c_best.pth / "
@@ -275,6 +279,8 @@ def d2c_infer(image: Image.Image, weight_path=None, device="cpu",
         "num_points": count_loc,
         "points": [[round(float(x), 1), round(float(y), 1)]
                    for x, y in points[:2000]],
+        **({"all_points": [[round(float(x), 2), round(float(y), 2)]
+                           for x, y in points]} if return_all_points else {}),
         "visualization": _to_b64(vis, rgb=False),
         "density_map": _to_b64(heat, rgb=False),
         "conf_threshold": float(conf_threshold),

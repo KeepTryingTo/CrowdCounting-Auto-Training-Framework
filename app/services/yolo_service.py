@@ -21,6 +21,7 @@ import json
 import os
 import random
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -126,10 +127,9 @@ YOLO_UPLOAD = {
 
 # YOLOv13 分支引擎缺失时的安装引导
 _YOLOV13_INSTALL_HINT = (
-    "当前 ultralytics 引擎不含 YOLOv13 架构（HyperACE/FullPAD/DS-C3k2 模块），"
-    "官方 ultralytics 尚未内置该架构。请在项目 third_party/yolov13 目录执行 "
-    "pip install -e .（或 git clone https://github.com/iMoonLab/yolov13 后安装），"
-    "然后重启服务（参考 iMoonLab/yolov13）。"
+    "当前环境无法加载 YOLOv13 架构（HyperACE/FullPAD/DS-C3k2）。请确认项目 "
+    "third_party/yolov13/yolov13.yaml 存在，且已安装 ultralytics / torch；"
+    "或改用 iMoonLab/yolov13 分支引擎。"
 )
 
 # 稳定的类别颜色（头部框固定用红色系更醒目，但保留调色板供多类场景）
@@ -271,13 +271,24 @@ def _model_class_for(model_name: str):
 
 
 def _yolov13_supported() -> bool:
-    """已安装引擎是否含 YOLOv13 架构（iMoonLab 分支：cfg/models/v13 或 yolov13*.yaml）"""
+    """当前引擎是否可用 YOLOv13。
+
+    两条路径：
+    1. 已安装 iMoonLab 分支（cfg/models/v13 或 yolov13*.yaml）；
+    2. 标准 ultralytics + 项目内置 third_party/yolov13 架构适配层。
+    """
     try:
         import ultralytics
         root = Path(ultralytics.__file__).resolve().parent
         if (root / "cfg" / "models" / "v13").is_dir():
             return True
-        return any(root.glob("cfg/models/**/yolov13*.yaml"))
+        if any(root.glob("cfg/models/**/yolov13*.yaml")):
+            return True
+    except Exception:
+        pass
+    try:
+        from app.services import yolov13_arch
+        return yolov13_arch.available()
     except Exception:
         return False
 
@@ -369,7 +380,7 @@ def list_models():
     for n, (d, _, _, _) in YOLOV13_URLS.items():
         out.append({"name": n,
                     "desc": (f"{d} — 头部框数据集训练后使用"
-                             + ("（需安装 yolov13 分支引擎）" if not v13_ok else "")
+                             + ("" if v13_ok else "（缺少 third_party/yolov13）")
                              + hint),
                     "type": "yolo", "pretrained": False,
                     "pretrained_local": False, "need_weight": True,
@@ -397,9 +408,9 @@ def list_train_models():
     v13_ok = _yolov13_supported()
     for n, (d, _, _, _) in YOLOV13_URLS.items():
         out.append({"name": n,
-                    "desc": (f"{d} — 官方 COCO 预训练微调（自动下载）"
+                    "desc": (f"{d} — 官方 COCO 预训练微调（自动下载，内置架构）"
                              if v13_ok else
-                             f"{d} — 需先安装 yolov13 分支引擎")
+                             f"{d} — 缺少 third_party/yolov13 架构")
                              + hint,
                     "pretrained": v13_ok, "pretrained_local": False,
                     "need_weight": not v13_ok})
@@ -718,8 +729,38 @@ def _yaml_quote(s) -> str:
     return s
 
 
+def _available_ram_mb():
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1048576.0
+    except Exception:
+        return None
+
+
+def _yolo_cpu_gt_limit(imgsz: int, batch_size: int):
+    """CPU 训练时单图 GT 框数上限的保守估计。
+
+    YOLO 的 TaskAlignedAssigner 会为每张图分配
+    ``n_gt × num_anchors`` 的 mask / 指标张量；JHU 等数据集存在
+    2 万+ GT 的极端图像，CPU 上会直接耗尽内存导致原生崩溃。
+    这里按可用内存和输入尺寸给出一个上限，超限图像在训练集中跳过。
+    """
+    avail = _available_ram_mb()
+    anchors = sum((imgsz // s) ** 2 for s in (8, 16, 32))
+    per_box_mb = anchors * 12 / 1048576.0   # mask + align + overlap
+    scale = (imgsz / 640.0) ** 2 * max(1, batch_size) / 2.0
+    fixed = 5000 * (2.0 / max(1, batch_size)) * (640.0 / imgsz) ** 2
+    if avail is None:
+        return int(max(500, min(8000, fixed)))
+    reserve = 1200 + 600 * scale
+    budget = max(0.0, avail * 0.8 - reserve)
+    dynamic = budget / per_box_mb if per_box_mb > 0 else 0
+    return int(max(500, min(20000, min(fixed, dynamic))))
+
+
 def _prepare_yolo_dataset(root: Path, fmt: str, save_dir: Path,
-                          val_ratio=0.2, seed=42, log=print):
+                          val_ratio=0.2, seed=42, log=print,
+                          max_gt_per_image=None):
     """将三种检测标注格式转换为 ultralytics 标准布局并生成 data.yaml。
 
     输出：save_dir/dataset/{images,labels}/{train,val}/ + data.yaml
@@ -759,6 +800,24 @@ def _prepare_yolo_dataset(root: Path, fmt: str, save_dir: Path,
         raise ValueError("训练集为空，请检查数据集目录结构")
     if not val_items:
         val_items = list(train_items)
+
+    if max_gt_per_image:
+        def _n_gt(ann):
+            try:
+                return int(np.asarray(ann).reshape(-1, 5).shape[0])
+            except Exception:
+                return 0
+        kept = [it for it in train_items
+                if _n_gt(it[1]) <= int(max_gt_per_image)]
+        skipped = len(train_items) - len(kept)
+        if kept and skipped:
+            log(f"[内存保护] 训练集中 {skipped} 张图像的 GT 框数 > "
+                f"{int(max_gt_per_image)}（极端密集），已跳过以避免 CPU "
+                f"内存崩溃；如需使用请减小输入尺寸/批大小或改用 GPU")
+            train_items = kept
+        elif not kept:
+            log(f"[内存保护] 所有训练图像 GT 框数都超过 "
+                f"{int(max_gt_per_image)}，未做过滤（请显著减小输入尺寸）")
 
     nc = (max(class_names) + 1) if class_names else 1
     names = [class_names.get(i, f"class_{i}") for i in range(nc)]
@@ -859,12 +918,21 @@ def run_yolo_train(task, params: dict):
     task.log(f"数据集: {dataset_path} | 设备: {device_str} | 输入尺寸: {imgsz}")
     set_seed(seed)
 
+    # CPU 训练内存保护：极端密集图像的 GT 框数会放大 TAL 分配张量，
+    # 直接在训练集准备阶段跳过，避免运行时 access violation 带走服务。
+    gt_limit = None
+    if not device_str.startswith("cuda"):
+        gt_limit = _yolo_cpu_gt_limit(imgsz, batch_size)
+        avail = _available_ram_mb()
+        task.log(f"[内存保护] CPU 训练单图 GT 上限 {gt_limit}"
+                 + (f"（可用内存 {avail:.0f}MB）" if avail is not None else ""))
+
     # 数据准备（YOLO / VOC / CSV → ultralytics 标准布局 + data.yaml）
     task.log("正在准备 ultralytics 数据集（链接图像 + 生成 YOLO 标签与 "
              "data.yaml）...")
     data_yaml, names = _prepare_yolo_dataset(
         Path(dataset_path), fmt, save_dir, val_ratio=val_ratio, seed=seed,
-        log=task.log)
+        log=task.log, max_gt_per_image=gt_limit)
     task.log(f"类别数: {len(names)} | 类别: {names}")
     (save_dir / "classes.json").write_text(
         json.dumps(names, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -944,15 +1012,17 @@ def run_yolo_train(task, params: dict):
     elif model_name in YOLOV13_URLS:
         if not _yolov13_supported():
             raise ValueError(_YOLOV13_INSTALL_HINT)
+        from app.services import yolov13_arch
         if pretrained:
             pt = _yolov13_weight_path(model_name, log=task.log)
-            model = model_cls(str(pt))
+            model = yolov13_arch.load_model(model_cls, pt)
             task.log(f"使用官方 COCO 预训练权重微调: {pt.name}"
-                     f"（iMoonLab/yolov13 Release）")
+                     f"（iMoonLab/yolov13 Release + 内置架构适配）")
         else:
-            model = model_cls(f"{model_name}.yaml")
-            task.log(f"从架构配置从头训练: {model_name}.yaml"
-                    f"（勾选「使用预训练权重」可改用官方权重微调）")
+            yaml_p = yolov13_arch.yaml_for(model_name)
+            model = yolov13_arch.load_model(model_cls, yaml_p)
+            task.log(f"从架构配置从头训练: {yaml_p.name}"
+                     f"（项目内置 YOLOv13 架构）")
     elif model_name in YOLO_UPLOAD:
         # 无内置预训练权重且未上传 .pt：回退到默认架构从头训练
         yaml_name = "yolov8n.yaml"
@@ -1169,6 +1239,13 @@ def run_yolo_train(task, params: dict):
     def _on_train_batch_end(trainer):
         if task.stop_event.is_set():
             raise _YoloStop()
+        # 内存看门狗：训练中内存持续下降时提前安全停止，避免原生 OOM
+        avail = _available_ram_mb()
+        if avail is not None and avail < 800:
+            raise RuntimeError(
+                f"可用内存不足（{avail:.0f}MB < 800MB），为避免整个服务进程"
+                f"崩溃已安全停止 YOLO 训练；请减小 batch size / 输入尺寸，"
+                f"或关闭其他占用内存的程序后重试（已保存的 last.pt 可续训）")
         # 不同版本 trainer 未必暴露 batch 序号，自行计数更稳
         _batch_log["i"] += 1
         i = _batch_log["i"]
@@ -1272,6 +1349,9 @@ def _load_yolo(model_name, weight_path, pretrained):
     _require_ultralytics()
     model_cls = _model_class_for(model_name)
     if weight_path:
+        if str(model_name).lower().startswith("yolov13"):
+            from app.services import yolov13_arch
+            return yolov13_arch.load_model(model_cls, weight_path)
         return model_cls(weight_path)
     if model_name in YOLO_AUTO:
         if not _model_supported(model_name):
@@ -1294,7 +1374,9 @@ def _load_yolo(model_name, weight_path, pretrained):
             raise ValueError("YOLOv13 推理需要权重：请勾选「使用预训练权重」"
                              "（自动下载官方 COCO 权重），或选择训练产物/"
                              "上传 .pt 权重文件")
-        return model_cls(str(_yolov13_weight_path(model_name)))
+        from app.services import yolov13_arch
+        return yolov13_arch.load_model(
+            model_cls, _yolov13_weight_path(model_name))
     if model_name in YOLO_UPLOAD:
         raise ValueError(f"模型「{model_name}」无内置权重："
                          f"请选择训练产物权重或上传 .pt 权重文件")
@@ -1376,3 +1458,145 @@ def headbox_infer(image: Image.Image, model_name, weight_path=None,
             "detections": detections, "num_detected": len(detections),
             "summary": summary, "conf_threshold": conf_threshold,
             "model": model_name, "box_based": True}
+
+
+def _save_box_txt(out_dir, stem, boxes, cls_ids, W, H):
+    """Save detections as YOLO-format .txt (class_id cx cy w h, normalized)."""
+    from app.services.crowd_counting import _unique_output_path
+    lines = []
+    for box, cid in zip(boxes, cls_ids):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        cx = ((x1 + x2) / 2.0) / max(W, 1)
+        cy = ((y1 + y2) / 2.0) / max(H, 1)
+        bw = (x2 - x1) / max(W, 1)
+        bh = (y2 - y1) / max(H, 1)
+        lines.append(f"{int(cid)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    path = _unique_output_path(out_dir, stem, ".txt")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _draw_boxes(img, boxes, scores, cls_ids, names):
+    """Draw detection boxes on a copy of the image (RGB PIL Image)."""
+    draw_img = img.copy()
+    draw = ImageDraw.Draw(draw_img)
+    font = _try_font(16)
+    for box, score, cid in zip(boxes, scores, cls_ids):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        cname = names.get(int(cid), str(cid))
+        color = _HEAD_COLOR if cname.lower() in ("head", "class_0") \
+            else _PALETTE[int(cid) % len(_PALETTE)]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        text = f"{cname} {float(score):.2f}"
+        tb = draw.textbbox((x1, y1), text, font=font)
+        draw.rectangle([tb[0] - 2, tb[1] - 2, tb[2] + 2, tb[3] + 2],
+                       fill=color)
+        draw.text((x1, y1), text, fill=(255, 255, 255), font=font)
+    return draw_img
+
+
+def run_box_test(task, params: dict):
+    """Head-box route: evaluate a YOLO weight on a dataset test split.
+
+    Predictions are saved as YOLO-format .txt (normalized cx cy w h) and
+    visualizations as PNG overlays, matching the density / point test routes.
+    """
+    model_name = params.get("model") or "yolov8n"
+    weight_path = params.get("weight_path")
+    if not weight_path or not Path(weight_path).is_file():
+        raise ValueError("测试需要训练产物或上传的权重文件（.pt）")
+    root = params["dataset_path"]
+    split = (params.get("split") or "test").lower()
+    device_str = params.get("device", "cpu")
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        device_str = "cpu"
+    conf_threshold = float(params.get("conf_threshold") or 0.5)
+    save_dir = Path(task.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = save_dir / "test_results.csv"
+
+    use_train = split == "train"
+
+    def _load(train):
+        try:
+            return load_yolo_items(root, train=train)
+        except ValueError:
+            return load_voc_items(root, train=train)
+
+    try:
+        items, class_names = _load(use_train)
+    except Exception as exc:
+        if use_train:
+            raise
+        task.log(f"未找到 Test/Val 划分（{exc}），回退到 Train 划分")
+        use_train = True
+        items, class_names = _load(True)
+    task.log(f"头部框测试 | 模型: {model_name} | 权重: {weight_path}")
+    task.log(f"数据集: {root} | 划分: {'Train' if use_train else 'Test/Val'} "
+             f"| 样本: {len(items)}")
+    save_outputs = bool(params.get("save_outputs"))
+    pred_dir = png_dir = None
+    if save_outputs:
+        from app.services.crowd_counting import _test_output_dirs
+        pred_dir, png_dir = _test_output_dirs(params, save_dir)
+        task.log(f"逐图预测框将保存为 .txt：{pred_dir}")
+        task.log(f"逐图可视化将保存为 .png：{png_dir}")
+
+    model = _load_yolo(model_name, weight_path, pretrained=False)
+    try:
+        names = dict(model.names or {}) or class_names
+    except Exception:
+        names = class_names
+
+    rows, errs = [], []
+    saved = saved_png = 0
+    t0 = time.time()
+    for i, (img_p, anns) in enumerate(items, 1):
+        if task.stop_event.is_set():
+            raise StopIteration()
+        gt_count = float(len(anns))
+        img = Image.open(img_p).convert("RGB")
+        W, H = img.size
+        _, boxes, scores, cls_ids = _predict(model, img, conf_threshold,
+                                             device_str)
+        pred_count = float(len(boxes))
+        stem = Path(img_p).stem
+        if pred_dir is not None:
+            _save_box_txt(pred_dir, stem, boxes, cls_ids, W, H)
+            vis_img = _draw_boxes(img, boxes, scores, cls_ids, names)
+            from app.services.crowd_counting import _unique_output_path
+            out_png = _unique_output_path(png_dir, stem, ".png")
+            vis_img.save(out_png, format="PNG")
+            saved += 1
+            saved_png += 1
+        err = pred_count - gt_count
+        errs.append(err)
+        rows.append({"name": stem, "pred": round(pred_count, 4),
+                     "gt": round(gt_count, 4), "error": round(err, 4)})
+        task.progress = i / len(items) * 100.0
+        if i % 20 == 0 or i == len(items):
+            task.log(f"  [{i}/{len(items)}] pred={pred_count:.0f} "
+                     f"gt={gt_count:.0f} | 耗时 {time.time() - t0:.1f}s")
+    if not errs:
+        raise ValueError("测试集没有有效样本")
+    arr = np.asarray(errs, dtype=np.float64)
+    mae = round(float(np.mean(np.abs(arr))), 3)
+    rmse = round(float(np.sqrt(np.mean(arr ** 2))), 3)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["name", "pred", "gt", "error"])
+        w.writeheader()
+        w.writerows(rows)
+    task.progress = 100.0
+    task.result = {"mae": mae, "rmse": rmse, "mse": rmse,
+                   "num_images": len(errs), "model": model_name,
+                   "dataset": str(root), "patch_size": 0,
+                   "per_image_csv": str(csv_path), "save_dir": str(save_dir),
+                   "saved_outputs": saved, "saved_pngs": saved_png,
+                   "point_format": "",
+                   "pred_dir": str(pred_dir) if pred_dir is not None else "",
+                   "png_dir": str(png_dir) if png_dir is not None else ""}
+    task.log(f"测试完成：MAE={mae:.3f} | RMSE={rmse:.3f} | "
+             f"样本={len(errs)} | 逐图结果={csv_path}")
+    if pred_dir is not None:
+        task.log(f"已保存 {saved} 个预测框文件（.txt）到 {pred_dir}")
+        task.log(f"已保存 {saved_png} 张可视化结果（.png）到 {png_dir}")

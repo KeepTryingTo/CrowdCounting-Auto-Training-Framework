@@ -1214,6 +1214,125 @@ def run_npy2png(task, params: dict):
 
 # ------------------------- P2PNet 点预测：训练与推理 -------------------------
 
+def _available_ram_mb():
+    """当前可用物理内存（MB）；psutil 缺失时返回 None。"""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1048576.0
+    except Exception:
+        return None
+
+
+# P2PNet 前向+反向的 CPU 峰值内存经验系数（MB / 像素 / 样本）。
+# 实测（VGG16_bn 骨干，torch CPU）：768x768/batch2 峰值约 4.0GB、
+# 512x512/batch1 约 0.9GB，按像素线性拟合约 3.4KB/像素/样本。
+_P2P_MB_PER_PIXEL = 0.0035
+# collate_fn_crowd → _max_by_axis_pad 会把 batch 两侧补齐到 128 的倍数
+_P2P_PAD_BLOCK = 128
+# P2PPointsDataset 随机放大上限：1 + 0.3·augment_strength
+_P2P_MAX_UPSCALE = 0.3
+
+
+def _p2p_pad_side(side):
+    """与 collate_fn_crowd 一致：把一边向上补齐到 128 的倍数。"""
+    side = max(_P2P_PAD_BLOCK, int(side))
+    block = _P2P_PAD_BLOCK
+    return ((side - 1) // block + 1) * block
+
+
+def _p2p_effective_side(img_size, augment=True, augment_strength=1.0):
+    """训练真实输入边长的上界（标称长边 → 随机放大 → collate 128 补齐）。
+
+    数据集把长边缩放到 img_size，训练随机缩放最大 1+0.3·strength，
+    collate 再把两侧补齐到 128 倍数。分辨率选择与内存保护都必须按这个
+    上界估算，否则会按“标称分辨率”低估 1.5~1.7 倍内存（实测 768 标称
+    实际跑 1024×768）。
+    """
+    base = max(256, int(img_size or 1024))
+    strength = max(0.0, min(2.0, float(augment_strength)))
+    scale = (1.0 + _P2P_MAX_UPSCALE * strength) if augment else 1.0
+    return _p2p_pad_side(round(base * scale))
+
+
+def _p2p_batch_working_mb(img_size, batch_size, augment=True,
+                          augment_strength=1.0):
+    """单个训练 batch（前向+反向）的峰值工作集（MB），按正方形上界估算。
+
+    不含常驻的模型/优化器/服务进程；给内存保护逐 batch 判断用。
+    """
+    side = _p2p_effective_side(img_size, augment, augment_strength)
+    return _P2P_MB_PER_PIXEL * side * side * max(1, int(batch_size))
+
+
+def _p2p_peak_estimate_mb(img_size, batch_size, augment=True,
+                          augment_strength=1.0):
+    """P2PNet CPU 训练总峰值内存粗估（MB）：batch 工作集 + 常驻开销。"""
+    return _p2p_batch_working_mb(
+        img_size, batch_size, augment, augment_strength) + 900.0
+
+
+def _fit_p2p_cpu_plan(img_size, batch_size, log, augment=True,
+                      augment_strength=1.0):
+    """按可用内存为 P2PNet CPU 训练选择安全的 (分辨率, batch)。
+
+    内存不足时不枚举原生崩溃（0xC0000005 会带走整个 Web 服务），而是自动
+    降低分辨率 / batch 并记录日志；连 256 + batch1 都放不下则明确报错。
+    估算按训练真实输入上界（含随机放大 + collate 128 补齐）计算。
+
+    优先保分辨率、其次降 batch：人群计数里分辨率对精度影响远大于 batch。
+    """
+    requested = int(img_size) if int(img_size) > 0 else 1024
+    requested_bs = max(1, int(batch_size))
+    avail = _available_ram_mb()
+    if avail is None:
+        return requested, requested_bs
+    candidates = [requested] + [s for s in (768, 640, 512, 448, 384, 320, 256)
+                               if s < requested]
+    # Windows 上 psutil.available 是物理可用内存，提交上限可能更紧；
+    # 留 25% 余量给服务进程 / 数据加载 / 页缓存
+    budget = avail * 0.75
+    for size in candidates:
+        for bs in range(requested_bs, 0, -1):
+            est = _p2p_peak_estimate_mb(size, bs, augment, augment_strength)
+            if est <= budget:
+                if (size, bs) != (requested, requested_bs):
+                    log(f"[内存保护] 可用内存 {avail:.0f}MB，请求 "
+                        f"{requested} 分辨率 + batch {requested_bs} 预计峰值 "
+                        f"{_p2p_peak_estimate_mb(requested, requested_bs, augment, augment_strength):.0f}MB，"
+                        f"已自动调整为 {size} 分辨率 + batch {bs}"
+                        f"（预计 {est:.0f}MB）")
+                return size, bs
+    raise ValueError(
+        f"可用内存不足（{avail:.0f}MB）：即使 256 分辨率 + batch 1 "
+        f"也放不下 P2PNet CPU 训练。请关闭浏览器/其它占内存程序后重试。")
+
+
+def _fit_p2p_cpu_size(img_size, batch_size, log, augment=True,
+                      augment_strength=1.0):
+    """兼容包装：只返回安全分辨率（batch 不变）。"""
+    return _fit_p2p_cpu_plan(img_size, batch_size, log, augment,
+                             augment_strength)[0]
+
+
+def _p2p_memory_guard(log, context="", need_mb=0.0):
+    """训练/验证过程中内存过低时抛 Python 异常，避免原生 OOM 崩溃进程。
+
+    need_mb>0 时按“本 batch 预计工作集”动态判断（须每个 batch 调用）：
+    单 batch CPU 峰值可达数 GB，原来的固定 1GB 阈值根本来不及拦，
+    分配失败时 PyTorch 原生层会直接 access violation 带走整个服务。
+    """
+    avail = _available_ram_mb()
+    if avail is None:
+        return
+    threshold = max(1000.0, float(need_mb) * 1.1 + 400.0)
+    if avail < threshold:
+        raise RuntimeError(
+            f"可用内存不足（{avail:.0f}MB < 需 {threshold:.0f}MB）{context}，"
+            f"继续训练会让 PyTorch 原生层直接崩溃（0xC0000005）并带走整个"
+            f"服务，已安全停止。请降低分辨率 / batch size、关闭浏览器或其它"
+            f"占内存程序后从断点续训。")
+
+
 def _build_p2pnet(training: bool, device):
     """构建 vendored P2PNet 模型 + criterion"""
     from types import SimpleNamespace
@@ -1274,14 +1393,15 @@ def _load_points_gt_any(gt_path: Path):
 
 class P2PPointsDataset(Dataset):
     """P2PNet 点预测数据集：图像 + 点标注（.txt x y / ShanghaiTech .mat）。
-    ImageNet 归一化；训练时随机缩放 [0.7, 1.3]（图像与坐标同步）。
+    ImageNet 归一化；训练时随机缩放 1±0.3·augment_strength（默认 [0.7, 1.3]，
+    图像与坐标同步），augment_strength=0 时只降不升。
     """
     def __init__(self, root, train=True, augment=True, augment_strength=1.0,
                  resize_to=0):
         self.root = Path(root)
         self.train = train
-        self.augment = augment
         self.aug_strength = max(0.0, min(2.0, augment_strength))
+        self.augment = bool(augment) and self.aug_strength > 0
         # 长边目标分辨率（0=保持原始分辨率）
         self.resize_to = max(0, int(resize_to or 0))
         img_dir, gt_dir = _crowd_dirs(self.root, train)
@@ -1324,10 +1444,12 @@ class P2PPointsDataset(Dataset):
     def __getitem__(self, idx):
         import random as _rnd
         img_path, gt_path, _kind = self.items[idx]
-        img = Image.open(img_path).convert("RGB")
+        # 上下文管理器确保解码后立即关闭文件句柄（长训练逐样本打开上千次）
+        with Image.open(img_path) as _im:
+            img = _im.convert("RGB")
         points = _load_points_gt(gt_path)
         # 基础分辨率：长边缩放到 resize_to（0=保持原始分辨率）。
-        # 放在随机尺度增强之前，保证训练时 [0.7,1.3] 随机缩放仍然生效。
+        # 放在随机尺度增强之前，保证训练时随机缩放仍然生效。
         if self.resize_to > 0:
             W, H = img.size
             long_side = max(W, H)
@@ -1341,8 +1463,11 @@ class P2PPointsDataset(Dataset):
                                                dtype=np.float32)
         if self.train and self.augment:
             W, H = img.size
-            # 1) 随机缩放（图像与坐标同步）
-            scale = _rnd.uniform(0.7, 1.3)
+            # 1) 随机缩放（图像与坐标同步）：由 augment_strength 控制幅度，
+            #    s=1 时即原来的 [0.7, 1.3]；s=0 只降不升，避免 CPU 训练
+            #    因放大把峰值内存抬到 1.7 倍。
+            s = self.aug_strength
+            scale = _rnd.uniform(max(0.7, 1.0 - 0.3 * s), 1.0 + 0.3 * s)
             if scale * min(W, H) > 128:
                 img = img.resize((max(1, int(W * scale)),
                                   max(1, int(H * scale))), Image.BILINEAR)
@@ -1396,6 +1521,12 @@ def run_p2pnet_train(task, params: dict):
     val_ratio = float(params.get("val_ratio", 0.2))
     # 输入分辨率：长边缩放目标（0=保持原始分辨率）
     img_size = int(params.get("img_size", 0) or 1024)   # 默认 1024（原 0=原始分辨率）
+    # CPU 训练的显存/内存保护：P2PNet 在 1024+batch2 往往需 6GB+，
+    # 内存耗尽时 PyTorch 原生层可能直接 access violation 并带走整个服务。
+    if not device_str.startswith("cuda"):
+        img_size, batch_size = _fit_p2p_cpu_plan(
+            img_size, batch_size, task.log, augment=augment,
+            augment_strength=float(params.get("augment_strength", 1.0) or 1.0))
     model_name = params.get("model", "p2pnet")
     loss_name = str(params.get("loss", "p2pnet"))
     from app.core.registry import (is_custom_model_for, get_custom_model,
@@ -1459,6 +1590,18 @@ def run_p2pnet_train(task, params: dict):
     device = torch.device("cuda" if (
         device_str.startswith("cuda") and torch.cuda.is_available())
         else "cpu")
+    # CPU 训练：按“真实输入上界（含随机放大 + 128 补齐）”估算单 batch 工作集，
+    # 供内存保护逐 batch 判断。原实现每 10 batch 才查一次且阈值仅 1GB，
+    # 单批峰值数 GB 时来不及拦 → PyTorch 原生 access violation 带走整个服务。
+    _p2p_need_mb = (_p2p_batch_working_mb(
+        img_size, batch_size, augment=augment,
+        augment_strength=augment_strength)
+        if device.type == "cpu" else 0.0)
+    _p2p_eval_need_mb = (_p2p_batch_working_mb(img_size, 1, augment=False)
+                         if device.type == "cpu" else 0.0)
+    if device.type == "cpu":
+        task.log(f"[内存保护] CPU 单 batch 预计峰值 {_p2p_need_mb:.0f}MB，"
+                 f"验证 {_p2p_eval_need_mb:.0f}MB（按随机放大+128 补齐上界）")
     if params.get("multi_gpu_mode") and torch.cuda.device_count() > 1:
         task.log("P2PNet 暂不支持多 GPU 并行，本次按单卡训练")
     if custom_point_model:
@@ -1556,6 +1699,8 @@ def run_p2pnet_train(task, params: dict):
             for bi, (samples, targets) in enumerate(val_loader, 1):
                 if task.stop_event.is_set():
                     raise StopIteration()
+                _p2p_memory_guard(task.log, f"(验证 {bi}/{total_batches})",
+                                  need_mb=_p2p_eval_need_mb)
                 samples = samples.to(device)
                 targets = [{k: v.to(device) for k, v in t.items()}
                            for t in targets]
@@ -1570,7 +1715,7 @@ def run_p2pnet_train(task, params: dict):
                         extra = sum(v for v in extra.values())
                     losses_v = losses_v + _aux_w * extra
                 if torch.isfinite(losses_v):
-                    losses.append(float(losses_v))
+                    losses.append(float(losses_v.detach()))
                 scores = torch.nn.functional.softmax(
                     outputs["pred_logits"], -1)[:, :, 1][0]
                 pred_cnt = int((scores > 0.5).sum())
@@ -1582,6 +1727,8 @@ def run_p2pnet_train(task, params: dict):
                         f"{np.mean(losses) if losses else 0.0:.4f} | "
                         f"MAE {np.mean(maes):.2f} | "
                         f"用时 {time.time() - t0:.1f}s")
+                # 验证逐 batch 及时释放张量（验证集 loop 也可能堆积中间结果）
+                del samples, targets, outputs, loss_dict, losses_v, scores
         return (float(np.mean(maes)) if maes else float("inf"),
                 float(np.mean(losses)) if losses else None)
 
@@ -1601,6 +1748,9 @@ def run_p2pnet_train(task, params: dict):
         for batch_idx, (samples, targets) in enumerate(train_loader):
             if task.stop_event.is_set():
                 raise StopIteration()
+            _p2p_memory_guard(task.log,
+                              f"(训练 epoch {epoch} batch {batch_idx + 1})",
+                              need_mb=_p2p_need_mb)
             samples = samples.to(device)
             targets = [{k: v.to(device) for k, v in t.items()}
                        for t in targets]
@@ -1623,7 +1773,8 @@ def run_p2pnet_train(task, params: dict):
                 torch.nn.utils.clip_grad_norm_(model.parameters(),
                                                clip_max_norm)
             optimizer.step()
-            total_loss += float(losses)
+            total_loss += float(losses.detach())
+            del samples, targets, outputs, loss_dict, losses
             n_batches += 1
             report_batch_progress(
                 task, epoch=epoch, epochs=epochs, batch_idx=batch_idx,
@@ -1672,21 +1823,23 @@ def run_p2pnet_train(task, params: dict):
         if early_stop and stop_metric is not None and stopper(stop_metric):
             task.log(f"早停触发（patience={early_stop}）")
             break
-        # 每轮收尾及时释放：gc 循环垃圾 + CUDA 缓存显存归还
-        release_training_memory()
+        # 每轮收尾及时释放：gc 循环垃圾 + CUDA 缓存显存归还（CPU 亦回收）
+        release_training_memory(task.log, reason=f"epoch {epoch} 收尾")
 
     save_loss_curves(save_dir, task.history)
     task.result = {"best_weight": str(best_path),
                    "last_weight": str(last_path),
                    "best_val_mae": best_mae if best_mae < float("inf")
                    else None,
+                   "img_size": img_size,
                    "save_dir": str(save_dir)}
     task.log(f"训练结束，最优 val_mae={best_mae:.4f}"
              if best_mae < float("inf") else "训练结束（无验证集）")
 
 
 def p2pnet_infer(image: Image.Image, weight_path=None, device="cpu",
-                 pretrained=True, conf_threshold=0.5):
+                 pretrained=True, conf_threshold=0.5,
+                 return_all_points=False):
     """P2PNet 推理：返回人数 + 点可视化图（红色圆点）+ 预测点坐标列表"""
     import base64
     import io
@@ -1772,12 +1925,15 @@ def p2pnet_infer(image: Image.Image, weight_path=None, device="cpu",
             "num_points": int(len(points)),
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in points[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in points]} if return_all_points else {}),
             "conf_threshold": conf_threshold, "model": "p2pnet",
             "point_based": True}
 
 
 def _custom_point_infer(image: Image.Image, model_name, weight_path=None,
-                        device="cpu", conf_threshold=0.5):
+                        device="cpu", conf_threshold=0.5,
+                        return_all_points=False):
     """自定义点预测模型推理（输出契约同 P2PNet: pred_logits/pred_points）"""
     import base64
     import io
@@ -1835,6 +1991,8 @@ def _custom_point_infer(image: Image.Image, model_name, weight_path=None,
             "num_points": int(len(points)),
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in points[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in points]} if return_all_points else {}),
             "conf_threshold": float(conf_threshold),
             "model": model_name, "point_based": True}
 
@@ -2338,7 +2496,8 @@ def run_p2r_train(task, params: dict):
 
 
 def p2r_infer(image: Image.Image, weight_path=None, device="cpu",
-              pretrained=True, conf_threshold=0.5):
+              pretrained=True, conf_threshold=0.5,
+              return_all_points=False):
     """P2R 推理：返回人数 + 预测点可视化（红色圆点）+ 预测点坐标列表
 
     人数 = logits>0 的位置数（与训练期评估口径一致）；conf_threshold 对
@@ -2410,6 +2569,8 @@ def p2r_infer(image: Image.Image, weight_path=None, device="cpu",
             "num_points": count,
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in pts[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in pts]} if return_all_points else {}),
             "model": "p2r", "point_based": True}
 
 
@@ -2970,7 +3131,8 @@ def run_cpoint_train(task, params: dict):
 
 
 def cpoint_infer(image: Image.Image, weight_path=None, device="cpu",
-                 pretrained=True, conf_threshold=0.5):
+                 pretrained=True, conf_threshold=0.5,
+                 return_all_points=False):
     """Consistent-Point 推理：score>阈值的提议点即人头（与训练期评估口径
     一致），返回人数 + 红点可视化 + 坐标列表"""
     import base64
@@ -3033,6 +3195,8 @@ def cpoint_infer(image: Image.Image, weight_path=None, device="cpu",
             "num_points": int(len(points)),
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in points[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in points]} if return_all_points else {}),
             "conf_threshold": float(conf_threshold), "model": "cp",
             "point_based": True}
 
@@ -3681,7 +3845,8 @@ def run_cu_train(task, params: dict):
 
 
 def cu_infer(image: Image.Image, weight_path=None, device="cpu",
-             pretrained=True, conf_threshold=0.5):
+             pretrained=True, conf_threshold=0.5,
+             return_all_points=False):
     """CU 推理：score>阈值的提议点即人头（与训练期评估口径一致），
     返回人数 + 红点可视化 + 坐标列表（兼容框架训练产物与独立复现项目的
     {'model': ...} checkpoint 两种格式）"""
@@ -3750,6 +3915,8 @@ def cu_infer(image: Image.Image, weight_path=None, device="cpu",
             "num_points": int(len(points)),
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in points[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in points]} if return_all_points else {}),
             "conf_threshold": float(conf_threshold), "model": "cu",
             "point_based": True}
 
@@ -3854,8 +4021,10 @@ def run_crowd_train(task, params: dict):
     n_npy = sum(1 for _, t in full.items if t == "npy")
     task.log(f"GT 构成: .npy {n_npy} 个（密度图以文件为准） | "
              f".txt {len(full.items) - n_npy} 个（现场生成，sigma={sigma}）")
+    # CPU 训练时 pin_memory 无收益（还会额外锁页内存），仅 CUDA 开启
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
+                              num_workers=num_workers,
+                              pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
                             num_workers=num_workers)
     task.log(f"训练样本: {n_train} | 验证样本: {n_val}（{val_src}）")
@@ -3873,7 +4042,8 @@ def run_crowd_train(task, params: dict):
     if _ddp_sampler is not None:
         train_loader = DataLoader(train_ds, batch_size=batch_size,
                                   shuffle=False, sampler=_ddp_sampler,
-                                  num_workers=num_workers, pin_memory=True)
+                                  num_workers=num_workers,
+                                  pin_memory=(device.type == "cuda"))
 
     # 损失：mse/mae/ssim/mse_ssim/dmcount（crowd_losses）+ custom: 自定义
     if str(loss_name).startswith("custom:"):
@@ -4071,17 +4241,106 @@ def _test_write_csv(path, rows):
         w.writerows(rows)
 
 
-def _density_tiled_count(model, img_t, patch):
-    """Density model count with optional non-overlapping patch inference.
+def _test_output_dirs(params, save_dir):
+    """Resolve (outputs_dir, pngs_dir) for test mode.
+
+    Predictions go to ``<base>/outputs`` and visualizations to
+    ``<base>/pngs``; ``<base>`` is the user-specified output_dir when given,
+    otherwise the per-run save_dir.
+    """
+    raw = (params.get("output_dir") or "").strip()
+    base = Path(raw).expanduser() if raw else Path(save_dir)
+    if not base.is_absolute():
+        base = Path(save_dir) / base
+    out_dir = base / "outputs"
+    png_dir = base / "pngs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir, png_dir
+
+
+def _unique_output_path(out_dir, stem, suffix):
+    """Avoid clobbering same-stem images with a numeric suffix."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{stem}{suffix}"
+    i = 1
+    while path.exists():
+        path = out_dir / f"{stem}_{i}{suffix}"
+        i += 1
+    return path
+
+
+def _save_density_npy(out_dir, stem, density):
+    path = _unique_output_path(out_dir, stem, ".npy")
+    np.save(path, np.asarray(density, dtype=np.float32))
+    return path
+
+
+def _save_density_png(png_dir, stem, image_path, density, count):
+    """Save a density-map overlay visualization (JET heatmap + original image)."""
+    import cv2
+    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if img is None:
+        with Image.open(image_path) as im:
+            img = np.asarray(im.convert("RGB"))[:, :, ::-1].copy()
+    h, w = img.shape[:2]
+    dens = np.asarray(density, np.float32)
+    if dens.shape != (h, w):
+        dens = cv2.resize(dens, (w, h), interpolation=cv2.INTER_LINEAR)
+    vis = _reference_overlay(img, dens)
+    vis_img = Image.fromarray(vis)
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(vis_img)
+    label = f"count = {float(count):.1f}"
+    draw.rectangle([6, 6, 6 + 8 * len(label), 26], fill=(0, 0, 0))
+    draw.text((10, 9), label, fill=(255, 255, 0))
+    path = _unique_output_path(png_dir, stem, ".png")
+    vis_img.save(path, format="PNG")
+    return path
+
+
+def _save_b64_png(png_dir, stem, b64_data):
+    """Save a base64-encoded PNG visualization returned by infer helpers."""
+    import base64
+    path = _unique_output_path(png_dir, stem, ".png")
+    path.write_bytes(base64.b64decode(b64_data))
+    return path
+
+
+def _save_points_file(out_dir, stem, fmt, points, count):
+    """Save point predictions as .txt (one 'x y' per line) or .mat (annPoints)."""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    fmt = (fmt or "txt").lower()
+    if fmt == "mat":
+        from scipy.io import savemat
+        path = _unique_output_path(out_dir, stem, ".mat")
+        savemat(str(path), {"annPoints": pts,
+                            "count": np.asarray([[float(count)]],
+                                                dtype=np.float64)})
+        return path
+    path = _unique_output_path(out_dir, stem, ".txt")
+    np.savetxt(str(path), pts, fmt="%.2f")
+    return path
+
+
+def _density_tiled_count(model, img_t, patch, return_density=True):
+    """Density model count/map with optional non-overlapping patch inference.
 
     img_t is a normalized [1,3,H,W] tensor. Tiles are padded to a multiple of
     32 so common stride-8 density backbones accept the last row/column.
+    Returns (count, num_tiles, density_map) where density_map is at the input
+    resolution (assembled per-tile outputs, mask-averaged); density_map is
+    None when return_density is False.
     """
     _, _, h, w = img_t.shape
     if not patch or (h <= patch and w <= patch):
-        return float(model(img_t)[0, 0].sum().item()), 0
+        dens = model(img_t)[0, 0]
+        return (float(dens.sum().item()), 0,
+                dens.detach().cpu().numpy() if return_density else None)
     total = 0.0
     tiles = 0
+    pred = None
+    mask = None
     for y in range(0, h, patch):
         for x in range(0, w, patch):
             tile = img_t[:, :, y:y + patch, x:x + patch]
@@ -4090,9 +4349,24 @@ def _density_tiled_count(model, img_t, patch):
             pw = (32 - tw % 32) % 32
             if ph or pw:
                 tile = F.pad(tile, (0, pw, 0, ph))
-            total += float(model(tile)[0, 0].sum().item())
+            out = model(tile)[0, 0]
+            total += float(out.sum().item())
             tiles += 1
-    return total, tiles
+            if not return_density:
+                continue
+            if pred is None:
+                pred = torch.zeros((h, w), dtype=out.dtype, device=out.device)
+                mask = torch.zeros((h, w), dtype=out.dtype, device=out.device)
+            if out.shape[-2:] != (th, tw):
+                out = F.interpolate(out.unsqueeze(0).unsqueeze(0),
+                                    size=(th, tw), mode="bilinear",
+                                    align_corners=False)[0, 0]
+            pred[y:y + th, x:x + tw] += out
+            mask[y:y + th, x:x + tw] += 1
+    if not return_density:
+        return total, tiles, None
+    dens = (pred / mask.clamp_min(1.0)).detach().cpu().numpy()
+    return total, tiles, dens
 
 
 def run_density_test(task, params: dict):
@@ -4132,10 +4406,18 @@ def run_density_test(task, params: dict):
     task.log(f"密度图测试 | 模型: {model_name} | 权重: {weight_path}")
     task.log(f"数据集: {root} | 划分: {'Train' if use_train else 'Test/Val'} "
              f"| 样本: {len(ds)} | patch: {patch or '整图'}")
+    save_outputs = bool(params.get("save_outputs"))
+    pred_dir, png_dir = _test_output_dirs(params, save_dir) \
+        if save_outputs else (None, None)
+    if pred_dir is not None:
+        task.log(f"逐图密度图将保存为 .npy：{pred_dir}")
+        task.log(f"逐图可视化将保存为 .png：{png_dir}")
     model = _build_crowd_model(model_name, pretrained=False)
     _load_weights_compat(model, weight_path, context="测试权重")
     model.to(device).eval()
     rows, errs = [], []
+    saved = 0
+    saved_png = 0
     t0 = time.time()
     with torch.no_grad():
         for i in range(len(ds)):
@@ -4143,17 +4425,30 @@ def run_density_test(task, params: dict):
                 raise StopIteration()
             img_t, target = ds[i]
             gt_count = float(target.sum().item())
-            if patch:
-                pred_count, n_tiles = _density_tiled_count(
-                    model, img_t.unsqueeze(0).to(device), patch)
-            else:
-                pred_count = float(model(img_t.unsqueeze(0).to(device))
-                                   [0, 0].sum().item())
-                n_tiles = 0
+            pred_count, n_tiles, dens = _density_tiled_count(
+                model, img_t.unsqueeze(0).to(device), patch,
+                return_density=save_outputs)
             pred_count = max(0.0, pred_count)
+            stem = ds.items[i][0].stem
+            if pred_dir is not None:
+                h, w = img_t.shape[-2:]
+                dm = torch.from_numpy(np.asarray(dens, np.float32)
+                                      ).reshape(1, 1, *np.shape(dens))
+                if tuple(dm.shape[-2:]) != (h, w):
+                    dm = F.interpolate(dm, size=(h, w), mode="bilinear",
+                                       align_corners=False)
+                dsum = float(dm.sum())
+                if dsum > 1e-8 and pred_count > 0:
+                    dm = dm * (pred_count / dsum)
+                dm_np = dm[0, 0].numpy()
+                _save_density_npy(pred_dir, stem, dm_np)
+                _save_density_png(png_dir, stem, ds.items[i][0], dm_np,
+                                  pred_count)
+                saved += 1
+                saved_png += 1
             err = pred_count - gt_count
             errs.append(err)
-            rows.append({"name": ds.items[i][0].stem,
+            rows.append({"name": stem,
                          "pred": round(pred_count, 4),
                          "gt": round(gt_count, 4),
                          "error": round(err, 4)})
@@ -4171,9 +4466,15 @@ def run_density_test(task, params: dict):
     task.result = {"mae": mae, "rmse": rmse, "mse": rmse,
                    "num_images": len(errs), "model": model_name,
                    "dataset": str(root), "patch_size": patch,
-                   "per_image_csv": str(csv_path), "save_dir": str(save_dir)}
+                   "per_image_csv": str(csv_path), "save_dir": str(save_dir),
+                   "saved_outputs": saved, "saved_pngs": saved_png,
+                   "pred_dir": str(pred_dir) if pred_dir is not None else "",
+                   "png_dir": str(png_dir) if png_dir is not None else ""}
     task.log(f"测试完成：MAE={mae:.3f} | RMSE={rmse:.3f} | "
              f"样本={len(errs)} | 逐图结果={csv_path}")
+    if pred_dir is not None:
+        task.log(f"已保存 {saved} 张预测密度图（.npy）到 {pred_dir}")
+        task.log(f"已保存 {saved_png} 张可视化结果（.png）到 {png_dir}")
 
 
 def _point_gt_count(gt_path: Path, kind: str):
@@ -4212,7 +4513,18 @@ def run_point_test(task, params: dict):
     task.log(f"数据集: {root} | 划分: {'Train' if use_train else 'Test/Val'} "
              f"| 样本: {len(ds)}"
              + (f" | 点模型忽略 patch={patch}" if patch else ""))
+    save_outputs = bool(params.get("save_outputs"))
+    point_format = (params.get("point_format") or "txt").lower()
+    if point_format not in ("txt", "mat"):
+        point_format = "txt"
+    pred_dir, png_dir = _test_output_dirs(params, save_dir) \
+        if save_outputs else (None, None)
+    if pred_dir is not None:
+        task.log(f"逐图预测点将保存为 .{point_format}：{pred_dir}")
+        task.log(f"逐图可视化将保存为 .png：{png_dir}")
     rows, errs = [], []
+    saved = 0
+    saved_png = 0
     t0 = time.time()
     for i, (img_p, gt_p, kind) in enumerate(ds.items):
         if task.stop_event.is_set():
@@ -4221,11 +4533,22 @@ def run_point_test(task, params: dict):
         img = Image.open(img_p).convert("RGB")
         out = crowd_infer(img, model_name=model_name,
                           weight_path=str(weight_path), device=device_str,
-                          pretrained=False)
+                          pretrained=False, return_all_points=save_outputs)
         pred_count = float(out.get("count") or 0.0)
+        stem = Path(img_p).stem
+        if pred_dir is not None:
+            pts = out.get("all_points")
+            if pts is None:
+                pts = out.get("points") or []
+            _save_points_file(pred_dir, stem, point_format, pts, pred_count)
+            vis_b64 = out.get("visualization")
+            if vis_b64:
+                _save_b64_png(png_dir, stem, vis_b64)
+                saved_png += 1
+            saved += 1
         err = pred_count - gt_count
         errs.append(err)
-        rows.append({"name": Path(img_p).stem, "pred": round(pred_count, 4),
+        rows.append({"name": stem, "pred": round(pred_count, 4),
                      "gt": round(gt_count, 4), "error": round(err, 4)})
         task.progress = (i + 1) / len(ds) * 100.0
         if (i + 1) % 20 == 0 or i + 1 == len(ds):
@@ -4239,17 +4562,28 @@ def run_point_test(task, params: dict):
     task.result = {"mae": mae, "rmse": rmse, "mse": rmse,
                    "num_images": len(errs), "model": model_name,
                    "dataset": str(root), "patch_size": patch,
-                   "per_image_csv": str(csv_path), "save_dir": str(save_dir)}
+                   "per_image_csv": str(csv_path), "save_dir": str(save_dir),
+                   "saved_outputs": saved, "saved_pngs": saved_png,
+                   "point_format": point_format if save_outputs else "",
+                   "pred_dir": str(pred_dir) if pred_dir is not None else "",
+                   "png_dir": str(png_dir) if png_dir is not None else ""}
     task.log(f"测试完成：MAE={mae:.3f} | RMSE={rmse:.3f} | "
              f"样本={len(errs)} | 逐图结果={csv_path}")
+    if pred_dir is not None:
+        task.log(f"已保存 {saved} 个预测点文件（.{point_format}）到 {pred_dir}")
+        task.log(f"已保存 {saved_png} 张可视化结果（.png）到 {png_dir}")
 
 
 # ------------------------- 推理 -------------------------
 
 def crowd_infer(image: Image.Image, model_name="ghostnetv2_10",
                 weight_path=None, device="cpu", pretrained=True,
-                conf_threshold=0.5):
-    """人群计数推理：返回估计人数 + 密度热力图（base64）"""
+                conf_threshold=0.5, return_all_points=False):
+    """人群计数推理：返回估计人数 + 密度热力图（base64）
+
+    return_all_points=True 时点预测结果额外返回完整 all_points（测试模式
+    保存逐图预测点用；常规推理仍截断到 2000 点以控制返回体大小）。
+    """
     import base64
     import io
     import matplotlib.cm as cm
@@ -4257,45 +4591,54 @@ def crowd_infer(image: Image.Image, model_name="ghostnetv2_10",
     if model_name == "p2pnet":
         return p2pnet_infer(image, weight_path=weight_path, device=device,
                             pretrained=pretrained,
-                            conf_threshold=conf_threshold)
+                            conf_threshold=conf_threshold,
+                            return_all_points=return_all_points)
     if model_name == "p2r":
         return p2r_infer(image, weight_path=weight_path, device=device,
                          pretrained=pretrained,
-                         conf_threshold=conf_threshold)
+                         conf_threshold=conf_threshold,
+                         return_all_points=return_all_points)
     if model_name == "cp":
         return cpoint_infer(image, weight_path=weight_path, device=device,
                             pretrained=pretrained,
-                            conf_threshold=conf_threshold)
+                            conf_threshold=conf_threshold,
+                            return_all_points=return_all_points)
     if model_name == "cu":
         return cu_infer(image, weight_path=weight_path, device=device,
                         pretrained=pretrained,
-                        conf_threshold=conf_threshold)
+                        conf_threshold=conf_threshold,
+                        return_all_points=return_all_points)
     if model_name == "pet":
         from app.services import pet_service
         return pet_service.pet_infer(
             image, weight_path=weight_path, device=device,
-            pretrained=pretrained, conf_threshold=conf_threshold)
+            pretrained=pretrained, conf_threshold=conf_threshold,
+            return_all_points=return_all_points)
     if model_name == "cltr":
         from app.services import cltr_service
         return cltr_service.cltr_infer(
             image, weight_path=weight_path, device=device,
-            pretrained=pretrained, conf_threshold=conf_threshold)
+            pretrained=pretrained, conf_threshold=conf_threshold,
+            return_all_points=return_all_points)
     if model_name == "raz":
         from app.services import raz_service
         return raz_service.raz_infer(
             image, weight_path=weight_path, device=device,
-            pretrained=pretrained, conf_threshold=conf_threshold)
+            pretrained=pretrained, conf_threshold=conf_threshold,
+            return_all_points=return_all_points)
     if model_name == "d2c":
         from app.services import d2c_service
         return d2c_service.d2c_infer(
             image, weight_path=weight_path, device=device,
-            pretrained=pretrained, conf_threshold=conf_threshold)
+            pretrained=pretrained, conf_threshold=conf_threshold,
+            return_all_points=return_all_points)
     # 自定义点预测模型（按 tasks 分区识别）
     from app.core.registry import is_custom_model_for
     if is_custom_model_for(model_name, "crowd_point"):
         return _custom_point_infer(
             image, model_name, weight_path=weight_path, device=device,
-            conf_threshold=conf_threshold)
+            conf_threshold=conf_threshold,
+            return_all_points=return_all_points)
 
     image = image.convert("RGB")
     W0, H0 = image.size

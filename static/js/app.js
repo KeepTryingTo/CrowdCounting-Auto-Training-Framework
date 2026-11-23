@@ -123,6 +123,8 @@ async function init() {
       if (el && !el.options.length) el.innerHTML = errOption;
     }
   }
+  // 页面加载/刷新时若已有训练在跑（或队列中），自动接管实时视图
+  try { await attachRunningTrainView(); } catch (_) { /* ignore */ }
   applyUrlHash();
   // 预渲染学习版图（不等用户点击，确保内容始终在 DOM 中）
   try { renderLearningMap(); } catch (e) { console.warn("预渲染学习版图:", e); }
@@ -383,6 +385,34 @@ function bindUploadPanel() {
       if (d) d.style.display = upVis.checked ? "" : "none";
     });
   }
+  // ---- 已上传数据集转换：点标注 → .txt / .npy，.npy → .png ----
+  const convNpy = $("#convToNpy");
+  const convTxt = $("#convToTxt");
+  if (convNpy) {
+    convNpy.addEventListener("change", () => {
+      if (convNpy.checked && convTxt) convTxt.checked = false;
+      const p = $("#convNpyParams");
+      if (p) p.style.display = convNpy.checked ? "" : "none";
+    });
+  }
+  if (convTxt) {
+    convTxt.addEventListener("change", () => {
+      if (convTxt.checked && convNpy) {
+        convNpy.checked = false;
+        const p = $("#convNpyParams");
+        if (p) p.style.display = "none";
+      }
+    });
+  }
+  const convPng = $("#convToPng");
+  if (convPng) {
+    convPng.addEventListener("change", () => {
+      const d = $("#convVisDirField");
+      if (d) d.style.display = convPng.checked ? "" : "none";
+    });
+  }
+  const convBtn = $("#btnConvDataset");
+  if (convBtn) convBtn.addEventListener("click", convertUploadedDataset);
   // ---- ④ GT 密度图转换与可视化工具（自训练卡片迁移至此）----
   $("#btnMat2Density").addEventListener("click", startMat2Density);
   $("#btnNpyVis").addEventListener("click", startNpyVis);
@@ -534,6 +564,73 @@ function pollUploadPostTask(taskId, dsName) {
   }, 2000);
 }
 
+/* 已上传数据集转换：点标注 → .txt / .npy 密度图，.npy → .png 可视化 */
+async function convertUploadedDataset() {
+  const name = ($("#convDsSelect") && $("#convDsSelect").value) || "";
+  if (!name) return toast(t("upload.convMsg.needDataset"), "error");
+  const toNpy = !!($("#convToNpy") && $("#convToNpy").checked);
+  const toTxt = !!($("#convToTxt") && $("#convToTxt").checked);
+  const toPng = !!($("#convToPng") && $("#convToPng").checked);
+  if (!toNpy && !toTxt && !toPng) {
+    return toast(t("upload.convMsg.needOption"), "error");
+  }
+  const body = {
+    to_npy: toNpy, to_txt: toTxt, vis_png: toPng,
+    sigma: +($("#convSigma") ? $("#convSigma").value : 2) || 2,
+    adaptive: !!($("#convAdaptive") && $("#convAdaptive").checked),
+    vis_dir: (($("#convVisDir") && $("#convVisDir").value) || "").trim(),
+  };
+  const btn = $("#btnConvDataset");
+  const st = $("#convStatus");
+  if (btn) { btn.disabled = true; btn.textContent = t("msg.starting"); }
+  if (st) st.textContent = tf("upload.convMsg.started", name);
+  try {
+    const r = await api(`/api/upload/dataset/${encodeURIComponent(name)}/convert`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    pollConvTask(r.task_id, name);
+  } catch (e) {
+    toast(e.message, "error", 8000);
+    if (btn) { btn.disabled = false; btn.textContent = t("upload.convBtn"); }
+    if (st) st.textContent = e.message || "";
+  }
+}
+
+function pollConvTask(taskId, name) {
+  const btn = $("#btnConvDataset");
+  const st = $("#convStatus");
+  const wrap = $("#convProgressWrap");
+  const bar = $("#convProgressBar");
+  if (wrap) wrap.style.display = "";
+  const timer = setInterval(async () => {
+    let task;
+    try { task = await api(`/api/crowd/train/tasks/${taskId}`); }
+    catch (_) { return; }
+    const pct = Math.round(task.progress || 0);
+    if (bar) bar.style.width = pct + "%";
+    if (st) {
+      st.textContent = `${statusLabel(task.status, task.kind)} · ${name} · ${pct}%` +
+        (task.error ? ` | ${task.error}` : "");
+    }
+    if (!["completed", "failed", "stopped"].includes(task.status)) return;
+    clearInterval(timer);
+    if (btn) { btn.disabled = false; btn.textContent = t("upload.convBtn"); }
+    if (wrap) setTimeout(() => { wrap.style.display = "none"; }, 1200);
+    if (task.status === "completed" && task.result) {
+      const r = task.result;
+      toast(tf("upload.convMsg.done", r.new_dataset || "",
+               r.txt_converted || 0, r.npy_converted || 0,
+               r.png_generated || 0), "success", 10000);
+      loadDatasetPanel();
+      loadUploads();
+      if (r.new_dataset) selectDatasetTree(r.new_dataset);
+    } else if (task.status === "failed" && st) {
+      st.textContent = task.error || t("status.failed");
+    }
+  }, 1500);
+}
+
 /* 渲染已上传数据集表格 */
 async function loadDatasetPanel() {
   const tbody = $("#dsTableBody");
@@ -599,6 +696,19 @@ function fillDsTreeSelect(dss) {
   if (keep && dss.some(d => d.name === keep)) sel.value = keep;
   else if (dss.length) sel.value = dss[0].name;
   loadDatasetTree(sel.value || "");
+  fillConvDsSelect(dss);
+}
+
+/* 已上传数据集转换：数据集下拉（与结构浏览器同源） */
+function fillConvDsSelect(dss) {
+  const sel = $("#convDsSelect");
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = `<option value="">${esc(t("upload.convCardSelect"))}</option>` +
+    dss.map(d =>
+      `<option value="${esc(d.name)}">${esc(d.name)}</option>`).join("");
+  if (keep && dss.some(d => d.name === keep)) sel.value = keep;
+  else if (dss.length) sel.value = dss[0].name;
 }
 
 /* 上传/下载完成后，让结构浏览器直接定位到新数据集 */
@@ -1231,7 +1341,8 @@ function bindTaskSelect() {
 
 /* ---------------- 独立测试模式 ---------------- */
 
-const TESTABLE_TASKS = ["crowd_sdg", "crowd_density", "crowd_point"];
+const TESTABLE_TASKS = ["crowd_sdg", "crowd_density", "crowd_point",
+  "crowd_box"];
 
 function refreshTestTasks() {
   const sel = $("#testTaskSelect");
@@ -1288,9 +1399,47 @@ function refreshTestDevices() {
   if (keep && [...dst.options].some(o => o.value === keep)) dst.value = keep;
 }
 
+function updateTestOutputUI() {
+  const saveChk = $("#testSaveOutputs");
+  const fields = $("#testOutputFields");
+  if (fields) fields.style.display =
+    saveChk && saveChk.checked ? "block" : "none";
+  const fmtField = $("#fieldTestPointFormat");
+  const taskKey = ($("#testTaskSelect") && $("#testTaskSelect").value) || "";
+  if (fmtField) fmtField.style.display =
+    taskKey === "crowd_point" ? "block" : "none";
+}
+
+async function pickTestOutputDir() {
+  const input = $("#testOutputDir");
+  const btn = $("#btnPickTestOutputDir");
+  if (!input || !btn) return;
+  btn.disabled = true;
+  try {
+    const r = await api("/api/crowd/pick-dir", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ initial_dir: input.value.trim() }),
+    });
+    if (r && r.path) input.value = r.path;
+  } catch (e) {
+    toast(e.message, "error", 8000);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function bindTestControls() {
   if (!$("#btnRunTest")) return;
-  $("#testTaskSelect").addEventListener("change", refreshTestModels);
+  $("#testTaskSelect").addEventListener("change", () => {
+    refreshTestModels();
+    updateTestOutputUI();
+  });
+  if ($("#testSaveOutputs")) {
+    $("#testSaveOutputs").addEventListener("change", updateTestOutputUI);
+  }
+  if ($("#btnPickTestOutputDir")) {
+    $("#btnPickTestOutputDir").addEventListener("click", pickTestOutputDir);
+  }
   $("#testDatasetSelect").addEventListener("change", (e) => {
     if (e.target.value) $("#testDatasetPath").value = "";
   });
@@ -1308,6 +1457,7 @@ function bindTestControls() {
   refreshTestWeights();
   refreshTestDatasets();
   refreshTestDevices();
+  updateTestOutputUI();
 }
 
 function stopTestPolling() {
@@ -1331,11 +1481,16 @@ async function runTest() {
   btn.textContent = t("msg.starting");
   $("#btnStopTest").disabled = true;
   $("#testMetrics").innerHTML = "";
+  if ($("#testSaveInfo")) $("#testSaveInfo").textContent = "";
   $("#testLog").textContent = "";
+  const saveOutputs = !!($("#testSaveOutputs") && $("#testSaveOutputs").checked);
   const body = {
     task: taskKey, model, weight_path: weight, dataset_path: dataset,
     split: $("#testSplit").value, patch_size: +($("#testPatch").value || 0),
     device: $("#testDevice").value || "cpu",
+    save_outputs: saveOutputs,
+    output_dir: saveOutputs ? ($("#testOutputDir").value || "").trim() : "",
+    point_format: $("#testPointFormat") ? $("#testPointFormat").value : "txt",
   };
   try {
     const r = await api("/api/crowd/test", {
@@ -1383,6 +1538,20 @@ async function pollTest() {
       `<div class="stat"><b>${esc(rmse)}</b><span>RMSE</span></div>` +
       `<div class="stat"><b>${esc(res.num_images)}</b><span>${esc(t("test.samples"))}</span></div>` +
       `<div class="stat"><b>${esc(res.model || "")}</b><span>${esc(t("test.model"))}</span></div>`;
+    if ($("#testSaveInfo")) {
+      const parts = [];
+      if (res.pred_dir) {
+        parts.push(`${t("test.savedOutputs")}${res.pred_dir}`
+          + (res.saved_outputs !== undefined
+             ? `（${tf("test.savedCount", res.saved_outputs)}）` : ""));
+      }
+      if (res.png_dir) {
+        parts.push(`${t("test.savedPngs")}${res.png_dir}`
+          + (res.saved_pngs !== undefined
+             ? `（${tf("test.savedCount", res.saved_pngs)}）` : ""));
+      }
+      $("#testSaveInfo").textContent = parts.join(" | ");
+    }
     toast(tf("test.msg.done", res.mae, rmse), "success", 8000);
     await loadUploads();
   } else if (task.status === "failed") {
@@ -1426,7 +1595,7 @@ const TRAIN_DEFAULTS = {
   // updateTrainModelUI 会按所选模型（p2r/cp/cu）纠正
   crowd_point: { ...TRAIN_DEFAULTS_BASE,
     lr: 0.0001, scheduler: "cosine",
-    loss: "p2pnet", imgSize: 1024 },
+    loss: "p2pnet", imgSize: 512 },
   crowd_box: { ...TRAIN_DEFAULTS_BASE,
     epochs: 50, batchSize: 4, lr: 0.01, optimizer: "sgd",
     scheduler: "cosine", loss: "yolo", imgSize: 640 },
@@ -1454,7 +1623,7 @@ const RESOLUTION_PRESETS = {
   box: [256, 320, 416, 480, 512, 640, 768, 960, 1024, 1280, 1536, 2048],
 };
 const RESOLUTION_DEFAULTS = {
-  density: 384, p2pnet: 1024, p2r: 256, cp: 256, cu: 256, pet: 256, cltr: 256,
+  density: 384, p2pnet: 512, p2r: 256, cp: 256, cu: 256, pet: 256, cltr: 256,
   sdg: 320, raz: 256, d2c: 384, box: 640,
 };
 
@@ -2437,6 +2606,34 @@ function gatherTrainParams() {
   };
 }
 
+function isTrainKind(kind) {
+  return /^crowd_/.test(String(kind || ""));
+}
+
+/* 找一个用于实时显示的训练任务：优先 running，其次排队最靠前的 queued */
+async function nextTrainTaskForView() {
+  let tasks;
+  try { tasks = await api("/api/crowd/train/tasks"); }
+  catch (_) { return null; }
+  const trains = (tasks || []).filter(x => isTrainKind(x.kind));
+  return trains.find(x => x.status === "running")
+    || trains.filter(x => x.status === "queued")
+      .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0))[0]
+    || null;
+}
+
+/* 保持实时训练视图：新任务排队时不抢占当前 running 任务的显示 */
+async function attachRunningTrainView() {
+  const next = await nextTrainTaskForView();
+  if (!next) return false;
+  const changed = state.trainTaskId !== next.id;
+  state.trainTaskId = next.id;
+  $("#btnStopTrain").disabled = false;
+  if (changed) $("#trainLog").textContent = "";
+  startPolling();
+  return true;
+}
+
 async function startTrain() {
   // 断点续训模式：必须选择/上传中断的 last.pth
   if ($("#resumeFromWeight") && $("#resumeFromWeight").checked &&
@@ -2455,12 +2652,19 @@ async function startTrain() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
     });
-    state.trainTaskId = r.task_id;
-    toast(tf("msg.trainStarted", r.run_name), "success");
-    $("#btnStopTrain").disabled = false;
-    $("#trainLog").textContent = "";
     refreshTaskHistory();
-    startPolling();
+    if (r.queued) {
+      // 已有正在训练的任务：只提示排队，不切换实时可视化
+      toast(tf("msg.trainQueued", r.run_name, r.queue_position || 1),
+            "info", 9000);
+      await attachRunningTrainView();
+    } else {
+      state.trainTaskId = r.task_id;
+      toast(tf("msg.trainStarted", r.run_name), "success");
+      $("#btnStopTrain").disabled = false;
+      $("#trainLog").textContent = "";
+      startPolling();
+    }
   } catch (e) {
     toast(tf("msg.startFailed", e.message), "error", 6000);
   } finally {
@@ -2506,6 +2710,13 @@ async function pollTrainStatus() {
       task.elapsed_seconds !== undefined) {
     timing.push(esc(tf("train.elapsed", formatDuration(task.elapsed_seconds))));
   }
+  const totalSec = task.estimated_total_seconds ??
+    (task.elapsed_seconds !== null && task.elapsed_seconds !== undefined &&
+     task.eta_seconds !== null && task.eta_seconds !== undefined
+      ? Number(task.elapsed_seconds) + Number(task.eta_seconds) : null);
+  if (task.status === "running" && totalSec !== null) {
+    timing.push(esc(tf("train.estTotal", formatDuration(totalSec))));
+  }
   if (task.status === "running" && task.eta_seconds !== null &&
       task.eta_seconds !== undefined) {
     timing.push(esc(tf("train.eta", formatDuration(task.eta_seconds))));
@@ -2544,6 +2755,15 @@ async function pollTrainStatus() {
     } else {
       toast(tf("msg.trainDone", statusLabel(task.status)),
             task.status === "completed" ? "success" : "error");
+    }
+    // 队列中的下一个任务：自动接管实时可视化（若仍在启动瞬间则显示排队）
+    const next = await nextTrainTaskForView();
+    if (next && next.id !== task.id) {
+      state.trainTaskId = next.id;
+      $("#btnStopTrain").disabled = false;
+      $("#trainLog").textContent = "";
+      toast(tf("msg.trainQueueNext", next.name), "info", 6000);
+      startPolling();
     }
   }
 }
@@ -2849,12 +3069,18 @@ async function resumeTrain(id) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task_id: id }),
     });
-    state.trainTaskId = r.task_id;
-    toast(tf("msg.resumeStarted", r.run_name), "success", 6000);
-    $("#btnStopTrain").disabled = false;
-    $("#trainLog").textContent = "";
     refreshTaskHistory();
-    startPolling();
+    if (r.queued) {
+      toast(tf("msg.trainQueued", r.run_name, r.queue_position || 1),
+            "info", 9000);
+      await attachRunningTrainView();
+    } else {
+      state.trainTaskId = r.task_id;
+      toast(tf("msg.resumeStarted", r.run_name), "success", 6000);
+      $("#btnStopTrain").disabled = false;
+      $("#trainLog").textContent = "";
+      startPolling();
+    }
   } catch (e) {
     toast(tf("msg.resumeFailed", e.message), "error", 6000);
   }
@@ -3423,6 +3649,7 @@ const hwState = {
   lastData: null,   // 最近一次状态（语言切换时重渲染）
   lastNet: null,    // 上次网络字节计数（计算速率）
   rates: null,      // {down, up} 字节/秒
+  inflight: false,  // 防止请求堆积（训练期间后端可能短暂无响应）
 };
 
 function hwColorClass(p) {
@@ -3453,10 +3680,21 @@ function fmtUptime(hours) {
   return (d > 0 ? d + t("hw.day") + " " : "") + h + t("hw.hour");
 }
 
+function setHwConnState(text, isError) {
+  const el = $("#hwConnState");
+  if (!el) return;
+  el.textContent = text || "";
+  el.style.color = isError ? "var(--red)" : "var(--text-dim)";
+}
+
 async function loadHwStatus() {
   const box = $("#hwContent");
+  if (hwState.inflight) return;   // 上一次请求还没结束：跳过本轮，避免堆积
+  hwState.inflight = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    const d = await api("/api/system/hardware");
+    const d = await api("/api/system/hardware", { signal: ctrl.signal });
     // 网络速率：相邻两次轮询的字节差 ÷ 时间差
     const now = Date.now();
     if (d.network && hwState.lastNet && hwState.lastNet.ts) {
@@ -3474,9 +3712,23 @@ async function loadHwStatus() {
     }
     hwState.lastData = d;
     renderHardware(d);
+    setHwConnState("", false);
   } catch (e) {
-    if (box) box.innerHTML =
-      `<p style="color:var(--red)">${esc(tf("msg.hwLoadFailed", e.message))}</p>`;
+    const raw = String((e && e.message) || e || "");
+    const offline = e && e.name === "AbortError" ||
+      /failed to fetch|networkerror|load failed|fetch/i.test(raw);
+    if (hwState.lastData) {
+      // 训练期间后端可能短暂繁忙：保留上次数据，仅提示重连
+      setHwConnState(t("msg.hwReconnecting"), true);
+    } else if (box) {
+      box.innerHTML =
+        `<p style="color:var(--red)">` +
+        `${esc(tf("msg.hwLoadFailed", offline ? t("msg.hwOffline") : raw))}` +
+        `</p>`;
+    }
+  } finally {
+    clearTimeout(timer);
+    hwState.inflight = false;
   }
 }
 

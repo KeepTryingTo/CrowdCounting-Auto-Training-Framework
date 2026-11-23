@@ -2,6 +2,8 @@
 """
 Mostly copy-paste from torchvision references.
 """
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -24,25 +26,77 @@ model_urls = {
 }
 
 
+_CORRUPT_MARKERS = (
+    "unexpected eof", "file might be corrupted", "pytorchstreamreader",
+    "failed finding central directory", "central directory", "bad zip",
+    "invalid load key", "unpicklingerror", "truncated",
+)
+
+
+def _is_corrupt_error(exc):
+    """只把「文件截断/损坏」判定为可重试，内存不足等错误原样抛出。"""
+    if isinstance(exc, EOFError):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _CORRUPT_MARKERS)
+
+
+def _load_local_vgg(path):
+    """加载本地 VGG 权重；损坏（如下载中断）时隔离文件并返回 None。
+
+    截断的 .pth 会让 torch.load 抛 "unexpected EOF ... file might be
+    corrupted"，不应让训练直接失败；隔离后回退到重新下载。
+    """
+    try:
+        return torch.load(str(path), map_location="cpu")
+    except Exception as exc:
+        if not _is_corrupt_error(exc):
+            raise
+        try:
+            path.replace(path.with_name(path.name + ".corrupt"))
+        except OSError:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        print(f"[vgg] 预训练权重损坏，已隔离 {path.name}: {exc}")
+        return None
+
+
 def _load_vgg_state(arch):
-    """vendor 改动：本地 weights/pretrained → torch hub URL 回退
-    （原实现硬编码 Linux 绝对路径）"""
+    """vendor 改动：本地 weights/pretrained → torch hub 缓存 → 在线下载。
+
+    原实现硬编码 Linux 绝对路径；这里额外处理下载中断产生的截断缓存。
+    """
     import os
     try:
         from config import WEIGHTS_DIR
         local = WEIGHTS_DIR / f"{arch}.pth"
         if local.is_file():
-            return torch.load(str(local), map_location="cpu")
+            state = _load_local_vgg(local)
+            if state is not None:
+                return state
     except Exception:
         pass
     # torch hub 缓存（已下载则离线可用）
     hub_path = os.path.join(torch.hub.get_dir(), "checkpoints",
                             os.path.basename(model_urls[arch]))
     if os.path.isfile(hub_path):
-        return torch.load(hub_path, map_location="cpu")
-    # 在线下载（torch hub 标准缓存位置）
-    return torch.hub.load_state_dict_from_url(model_urls[arch],
-                                              map_location="cpu")
+        state = _load_local_vgg(Path(hub_path))
+        if state is not None:
+            return state
+    # 在线下载（torch hub 标准缓存位置，SHA256 校验防止截断文件）
+    try:
+        return torch.hub.load_state_dict_from_url(
+            model_urls[arch], map_location="cpu", check_hash=True,
+            progress=True)
+    except Exception as exc:
+        if not _is_corrupt_error(exc):
+            raise
+        raise RuntimeError(
+            f"VGG 预训练权重 {arch} 缓存损坏且重新下载失败：{exc}\n"
+            f"请删除 {hub_path} 后重试，或手动将完整的 "
+            f"{os.path.basename(model_urls[arch])} 放入该目录。") from exc
 
 
 class VGG(nn.Module):

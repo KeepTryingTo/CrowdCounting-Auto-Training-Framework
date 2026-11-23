@@ -181,6 +181,7 @@ def _run_stage(task, model, main_model: Optional[MainNet],
                aux_w: float = 1.0) -> Optional[float]:
     if epochs <= 0:
         return None
+    from app.services.train_common import release_training_memory
     _set_stage_trainable(model, stage)
     optimizer = make_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -232,6 +233,9 @@ def _run_stage(task, model, main_model: Optional[MainNet],
             task.best = {"epoch": state["done"], "val_mae": round(score, 4)}
             _save(best_path, current_main, current_raz, args, stage,
                   state["done"], task.best)
+        # 每轮收尾及时回收：gc（图窗/循环引用）+ CUDA 缓存显存归还；
+        # RAZ 的 Main-Net/RAZ-Net 均为 VGG 级骨干，长训练不回收会逐轮爬升
+        release_training_memory(task.log, reason=f"{stage} epoch 收尾")
     if best_state is not None:
         model.load_state_dict(best_state)
     return None if best == float("inf") else best
@@ -411,7 +415,7 @@ def _to_b64(img: Image.Image) -> str:
 
 def raz_infer(image: Image.Image, weight_path=None, device="cpu",
               pretrained=False, conf_threshold=0.5, max_side=1536,
-              raz_rounds=1):
+              raz_rounds=1, return_all_points=False):
     """Single-image RAZ inference used by the framework's inference route."""
     if not weight_path:
         raise ValueError("RAZ 推理需要训练产物权重（raz_best.pth / raz_last.pth）")
@@ -469,6 +473,10 @@ def raz_infer(image: Image.Image, weight_path=None, device="cpu",
         "num_points": int(len(pts)),
         "points": [[round(float(x), 1), round(float(y), 1)]
                    for x, y in pts[:2000]],
+        **({"all_points": [[round(float(x), 2), round(float(y), 2)]
+                           for x, y in pts],
+           "all_scores": [round(float(s), 4) for s in scores]}
+          if return_all_points else {}),
         "scores": [round(float(s), 4) for s in scores[:2000]],
         "visualization": _to_b64(canvas),
         "density_map": _to_b64(Image.fromarray(heat)),

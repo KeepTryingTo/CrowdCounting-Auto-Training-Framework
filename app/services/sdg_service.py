@@ -396,7 +396,8 @@ def _image_tensor(img, device):
 @torch.no_grad()
 def evaluate_dataset(task, model, root, device, log_para=LOG_PARA,
                      patch_size=0, csv_path=None, tag="test",
-                     items=None, epoch=None, epochs=None):
+                     items=None, epoch=None, epochs=None, pred_dir=None,
+                     png_dir=None):
     """跨域评估：MAE / MSE（+ 逐图 CSV）。返回 result dict
 
     items 给出时直接使用该样本列表（训练期无目标域时由源训练集
@@ -453,6 +454,25 @@ def evaluate_dataset(task, model, root, device, log_para=LOG_PARA,
                 nl += 1
         except Exception:
             pass
+        if pred_dir is not None:
+            # 保存逐图预测密度图（.npy，sum≈预测人数；统一到原图分辨率）
+            dm = dens_pred
+            if dm.dim() == 4:
+                dm = dm[0, 0]
+            dm = (dm.float() / max(float(log_para), 1e-8)).detach().cpu()
+            if tuple(dm.shape[-2:]) != (H, W):
+                dm = F.interpolate(dm[None, None], size=(H, W),
+                                   mode="bilinear", align_corners=False)[0, 0]
+            dsum = float(dm.sum())
+            if dsum > 1e-8 and pred_cnt > 0:
+                dm = dm * (pred_cnt / dsum)
+            from app.services.crowd_counting import _save_density_npy
+            dm_np = dm.numpy()
+            _save_density_npy(Path(pred_dir), img_p.stem, dm_np)
+            if png_dir is not None:
+                from app.services.crowd_counting import _save_density_png
+                _save_density_png(Path(png_dir), img_p.stem, img_p, dm_np,
+                                  pred_cnt)
         err = pred_cnt - gt_cnt
         errs.append(err)
         rows.append({"name": img_p.stem, "pred": round(pred_cnt, 4),
@@ -481,6 +501,10 @@ def evaluate_dataset(task, model, root, device, log_para=LOG_PARA,
             "loss": loss_mean,
             "num_images": int(len(errs)), "dataset": str(root),
             "per_image_csv": str(csv_path) if csv_path else "",
+            "saved_outputs": int(len(rows)) if pred_dir is not None else 0,
+            "saved_pngs": int(len(rows)) if png_dir is not None else 0,
+            "pred_dir": str(pred_dir) if pred_dir is not None else "",
+            "png_dir": str(png_dir) if png_dir is not None else "",
             "rows": rows}
 
 
@@ -939,16 +963,28 @@ def run_sdg_test(task, params: dict):
     patch = int(params.get("sdg_test_patch") or 0)
     save_dir = Path(task.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    pred_dir = None
+    png_dir = None
+    if params.get("save_outputs"):
+        from app.services.crowd_counting import _test_output_dirs
+        pred_dir, png_dir = _test_output_dirs(params, save_dir)
+        task.log(f"逐图预测密度图将保存为 .npy：{pred_dir}")
+        task.log(f"逐图可视化将保存为 .png：{png_dir}")
     res = evaluate_dataset(task, model, root, device, log_para=log_para,
                            patch_size=patch,
                            csv_path=save_dir / "test_results.csv",
-                           tag="test")
+                           tag="test", pred_dir=pred_dir, png_dir=png_dir)
     task.progress = 100.0
     task.result = {**res, "weight_path": str(weight_path),
                    "model": model_name, "backbone": backbone,
                    "save_dir": str(save_dir)}
     task.log(f"泛化测试结果：MAE={res['mae']:.3f} | RMSE={res['mse']:.3f} | "
              f"样本 {res['num_images']} 张（逐图结果见 test_results.csv）")
+    if pred_dir is not None:
+        task.log(f"已保存 {res.get('saved_outputs', 0)} 张预测密度图"
+                 f"（.npy）到 {pred_dir}")
+        task.log(f"已保存 {res.get('saved_pngs', 0)} 张可视化结果"
+                 f"（.png）到 {png_dir}")
 
 
 # ---------------------------------------------------------------------------

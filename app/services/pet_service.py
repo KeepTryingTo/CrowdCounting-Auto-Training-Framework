@@ -525,7 +525,8 @@ def run_pet_train(task, params: dict):
 # ------------------------- 推理 -------------------------
 
 def pet_infer(image: Image.Image, weight_path=None, device="cpu",
-              pretrained=True, conf_threshold=0.5):
+              pretrained=True, conf_threshold=0.5,
+              return_all_points=False):
     """PET 推理：返回人数 + 预测点可视化（红色圆点）"""
     import base64
     import io
@@ -593,6 +594,8 @@ def pet_infer(image: Image.Image, weight_path=None, device="cpu",
             "num_points": int(len(pts_xy)),
             "points": [[round(float(p[0]), 1), round(float(p[1]), 1)]
                        for p in pts_xy[:2000]],
+            **({"all_points": [[round(float(p[0]), 2), round(float(p[1]), 2)]
+                               for p in pts_xy]} if return_all_points else {}),
             "conf_threshold": thr, "model": "pet", "point_based": True}
 
 

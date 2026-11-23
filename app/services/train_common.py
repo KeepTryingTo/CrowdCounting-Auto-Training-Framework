@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """训练通用增强：随机种子、早停、checkpoint 完整状态、损失曲线保存、断点续训、DDP 分布式、训练内存及时释放"""
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -9,23 +10,67 @@ import torch
 
 # ------------------------- 训练内存及时释放 -------------------------
 
+def _process_rss_mb():
+    """当前进程 RSS（MB）；psutil 缺失时返回 None。"""
+    try:
+        import os
+        import psutil
+        return psutil.Process(os.getpid()).memory_info().rss / 1048576.0
+    except Exception:
+        return None
+
+
+def _trim_cpu_heap():
+    """尽力把 CPU 堆的空闲页还给操作系统（幂等、best-effort）。
+
+    PyTorch CPU 张量走 CRT 的 aligned malloc/free；Windows 的进程堆在
+    free 后常把大块留在空闲链表里不还给 OS，长训练逐轮分配/释放会造成
+    提交内存爬升与碎片化（表现为“训练几轮后可用内存越来越少”）。
+    CRT 的 _heapmin / glibc 的 malloc_trim 只能整理本 C 运行时堆，故在
+    每轮回调一次即可，失败静默忽略。
+    """
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            for dll in ("ucrtbase", "msvcrt"):
+                try:
+                    fn = getattr(ctypes.CDLL(dll), "_heapmin", None)
+                    if fn is not None:
+                        fn()
+                        return
+                except Exception:
+                    continue
+        else:
+            import ctypes
+            try:
+                ctypes.CDLL(None).malloc_trim(0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def release_training_memory(log=None, reason="内存释放"):
-    """训练内存及时释放（每轮结束 / 任务收尾统一调用，幂等、毫秒级）：
+    """训练内存及时释放（每轮结束 / 任务收尾统一调用，幂等）：
 
     1. gc.collect()：回收循环引用垃圾 —— 每轮的 matplotlib 图窗
        （Figure↔Axes↔Artist 互相引用）、数据集/增强临时对象等，
        引用计数无法释放，惰性 GC 阈值触发前会逐轮堆积（长训练可
        累积 GB 级）；
-    2. torch.cuda.empty_cache()：caching allocator 把已释放张量的
-       显存块留在池中复用、不主动归还驱动 —— 同卡并发训练（任务
-       管理器默认并发 2）、训练后同卡推理会被这些「账面已释放」的
-       块拖到 OOM，须显式归还。仅归还空闲块，绝不影响在用张量。
+    2. _trim_cpu_heap()：把 CRT 堆空闲页还给 OS，缓解 CPU 训练逐轮
+       分配/释放造成的提交内存爬升与碎片化；
+    3. torch.cuda.empty_cache()：caching allocator 把已释放张量的
+       显存块留在池中复用、不主动归还驱动 —— 同卡并发训练、训练后
+       同卡推理会被这些「账面已释放」的块拖到 OOM，须显式归还。
+       仅归还空闲块，绝不影响在用张量。
 
-    未初始化 CUDA（纯 CPU 训练）时退化为纯 gc。log 传入时仅在实际
-    归还了 ≥1MB 显存的情况下记录一行，避免逐轮刷屏。
+    未初始化 CUDA（纯 CPU 训练）时退化为前两步。log 传入时仅在实际
+    释放了较可观内存时记录一行，避免逐轮刷屏。
     """
     import gc
+    rss_before = _process_rss_mb()
     gc.collect()
+    _trim_cpu_heap()
     freed_mb = 0.0
     try:
         if torch.cuda.is_available() and torch.cuda.is_initialized():
@@ -34,9 +79,17 @@ def release_training_memory(log=None, reason="内存释放"):
             freed_mb = (before - torch.cuda.memory_reserved()) / 1048576
     except Exception:
         pass
-    if log is not None and freed_mb >= 1.0:
+    rss_after = _process_rss_mb()
+    cpu_freed = ((rss_before - rss_after)
+                 if rss_before is not None and rss_after is not None else 0.0)
+    if log is not None and (freed_mb >= 1.0 or cpu_freed >= 200.0):
         try:
-            log(f"{reason}：已归还 CUDA 缓存显存 {freed_mb:.0f} MB")
+            parts = []
+            if freed_mb >= 1.0:
+                parts.append(f"CUDA 缓存 {freed_mb:.0f}MB")
+            if cpu_freed >= 200.0:
+                parts.append(f"CPU {cpu_freed:.0f}MB")
+            log(f"{reason}：已释放 " + " / ".join(parts))
         except Exception:
             pass
 

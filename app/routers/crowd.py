@@ -16,7 +16,7 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import torch
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -421,7 +421,7 @@ def resume_train(body: dict):
     task_manager.submit(task, runner, params)
     return {"task_id": task.id, "save_dir": str(save_dir),
             "run_name": t.name, "resume_from": str(weight),
-            "kind": kind}
+            "kind": kind, **_queue_fields(task)}
 
 
 @router.delete("/train/tasks/{task_id}")
@@ -594,7 +594,7 @@ def npy_to_png(npy_dir: str, save_dir: str = "", mode: str = "heat",
     return {"task_id": task.id, "save_dir": str(sd)}
 
 
-def _unique_run_dir(base_dir: Path, run_name: str) -> tuple[str, Path]:
+def _unique_run_dir(base_dir: Path, run_name: str) -> Tuple[str, Path]:
     """Return a unique training run name/directory.
 
     If the requested run name already exists (same dataset/algorithm/model
@@ -613,6 +613,13 @@ def _unique_run_dir(base_dir: Path, run_name: str) -> tuple[str, Path]:
             path = Path(base_dir) / candidate
             n += 1
     return candidate, path
+
+
+def _queue_fields(task):
+    """训练任务提交后的排队信息（queue_position>0 表示还在等待）。"""
+    pos = int(getattr(task, "queue_position", 0) or 0)
+    return {"queued": pos > 0, "queue_position": pos,
+            "status": getattr(task, "status", "")}
 
 
 @router.post("/train")
@@ -685,13 +692,13 @@ def start_train(params: TrainParams):
         p = params.dict()
         task_manager.submit(task, _get_box_runner(), p)
         return {"task_id": task.id, "save_dir": str(save_dir),
-                "run_name": run_name}
+                "run_name": run_name, **_queue_fields(task)}
     # 单域泛化：独立 runner（元学习 / 双分支一致性）
     if params.task == "crowd_sdg":
         p = params.dict()
         task_manager.submit(task, _get_sdg_runner(), p)
         return {"task_id": task.id, "save_dir": str(save_dir),
-                "run_name": run_name}
+                "run_name": run_name, **_queue_fields(task)}
     # DDP 分布式模式（multi_gpu_mode="ddp"）：经 mp.spawn 每卡一进程
     from app.services import ddp_launcher
     p = params.dict()
@@ -704,9 +711,10 @@ def start_train(params: TrainParams):
         task_manager.submit(task, ddp_launcher.run_ddp_train, p, params.task)
         return {"task_id": task.id, "save_dir": str(save_dir),
                 "run_name": run_name, "distributed": True,
-                "world_size": world}
+                "world_size": world, **_queue_fields(task)}
     task_manager.submit(task, TRAIN_RUNNERS[params.task], p)
-    return {"task_id": task.id, "save_dir": str(save_dir), "run_name": run_name}
+    return {"task_id": task.id, "save_dir": str(save_dir),
+            "run_name": run_name, **_queue_fields(task)}
 
 
 @router.post("/sdg/test")
@@ -759,9 +767,10 @@ def start_test(body: dict):
     body = body or {}
     task_key = (body.get("task") or "crowd_sdg").strip()
     model = (body.get("model") or "").strip()
-    if task_key not in ("crowd_sdg", "crowd_density", "crowd_point"):
-        raise HTTPException(400, "测试模式暂支持 crowd_sdg / crowd_density / "
-                                 "crowd_point（头部框请使用推理或训练验证）")
+    if task_key not in ("crowd_sdg", "crowd_density", "crowd_point",
+                        "crowd_box"):
+        raise HTTPException(400, "测试模式支持 crowd_sdg / crowd_density / "
+                                 "crowd_point / crowd_box")
     if not model:
         raise HTTPException(400, "请选择测试算法 / 模型")
     _check_route_model(task_key, model)
@@ -780,13 +789,35 @@ def start_test(body: dict):
     if split not in ("test", "train"):
         split = "test"
     patch = max(0, int(body.get("patch_size") or 0))
+    save_outputs = bool(body.get("save_outputs"))
+    point_format = (body.get("point_format") or "txt").strip().lower()
+    if point_format not in ("txt", "mat"):
+        point_format = "txt"
+    output_dir = ""
+    if save_outputs:
+        raw_out = (body.get("output_dir") or "").strip()
+        if raw_out:
+            out_p = Path(raw_out).expanduser()
+            if not out_p.is_absolute():
+                out_p = RUNS_DIR / "test" / out_p
+        else:
+            out_p = None
+        if out_p is not None:
+            try:
+                out_p.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise HTTPException(400, f"无法创建保存目录: {out_p} ({exc})")
+            output_dir = str(out_p)
     params = {"task": task_key, "model": model, "weight_path": str(wp),
               "dataset_path": str(ds), "split": split,
               "patch_size": patch, "sdg_test_patch": patch,
               "device": device,
               "sdg_backbone": body.get("sdg_backbone") or None,
               "sdg_num_clusters": int(body.get("sdg_num_clusters") or 4),
-              "conf_threshold": float(body.get("conf_threshold") or 0.5)}
+              "conf_threshold": float(body.get("conf_threshold") or 0.5),
+              "save_outputs": save_outputs,
+              "output_dir": output_dir,
+              "point_format": point_format}
     run_name = (f"test_{task_key.replace('crowd_', '')}_{model}_"
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     run_name = re.sub(r"[^\w\-]", "_", run_name)
@@ -802,11 +833,58 @@ def start_test(body: dict):
         runner = sdg_service.run_sdg_test
     elif task_key == "crowd_density":
         runner = crowd_counting.run_density_test
+    elif task_key == "crowd_box":
+        from app.services import yolo_service
+        runner = yolo_service.run_box_test
     else:
         runner = crowd_counting.run_point_test
     task_manager.submit(task, runner, params)
     return {"task_id": task.id, "save_dir": str(save_dir),
             "run_name": run_name}
+
+
+@router.post("/pick-dir")
+def pick_dir(body: dict = None):
+    """Open a native folder picker on the server host and return its path.
+
+    The web UI cannot read an absolute local path from a browser folder
+    input, so the local deployment opens a dialog in a child process and
+    returns the selected directory ("" when the user cancels).
+    """
+    import os
+    import subprocess
+    import sys
+    initial = ((body or {}).get("initial_dir") or "").strip()
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    import tkinter as tk\n"
+        "    from tkinter import filedialog\n"
+        "    root = tk.Tk()\n"
+        "    root.withdraw()\n"
+        "    root.attributes('-topmost', True)\n"
+        "    start = sys.argv[1] if len(sys.argv) > 1 else None\n"
+        "    p = filedialog.askdirectory(initialdir=start or None,\n"
+        "                                title='选择保存目录', mustexist=False)\n"
+        "    root.destroy()\n"
+        "    print(p or '')\n"
+        "except Exception as exc:\n"
+        "    print('__ERROR__' + str(exc))\n"
+    )
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    try:
+        proc = subprocess.run([sys.executable, "-c", script, initial],
+                              capture_output=True, text=True, timeout=600,
+                              encoding="utf-8", errors="replace", env=env)
+    except Exception as exc:
+        raise HTTPException(500, f"无法打开目录选择窗口: {exc}")
+    out = (proc.stdout or "").strip().splitlines()
+    path = out[-1].strip() if out else ""
+    if path.startswith("__ERROR__"):
+        raise HTTPException(
+            500, "无法打开目录选择窗口（当前环境可能没有图形界面），"
+                 "请手动输入保存路径: " + path[len("__ERROR__"):])
+    return {"path": path}
 
 
 @router.get("/train/tasks")

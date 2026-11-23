@@ -569,6 +569,28 @@
 
         <div class="card wide">
           <h3 data-i18n="test.card3">③ 测试执行与结果</h3>
+          <div class="field inline">
+            <input id="testSaveOutputs" type="checkbox">
+            <label for="testSaveOutputs" data-i18n="test.saveOutputs">保存逐图预测结果</label>
+          </div>
+          <div id="testOutputFields" style="display:none">
+            <div class="field"><label data-i18n="test.outputDir">保存目录（留空 → 本次运行目录；结果存 outputs/，可视化存 pngs/）</label>
+              <div style="display:flex;gap:8px;align-items:center">
+                <input id="testOutputDir" type="text" placeholder="服务器绝对路径，或点击右侧选择">
+                <button class="btn small" id="btnPickTestOutputDir" style="white-space:nowrap;margin-top:0"
+                        data-i18n="test.pickDir">选择目录</button>
+              </div></div>
+            <div class="field" id="fieldTestPointFormat">
+              <label data-i18n="test.pointFormat">点预测结果格式</label>
+              <select id="testPointFormat">
+                <option value="txt" data-i18n="test.pointFormatTxt">.txt（每行 x y）</option>
+                <option value="mat" data-i18n="test.pointFormatMat">.mat（annPoints）</option>
+              </select>
+            </div>
+            <p class="hint" data-i18n="test.saveHint">
+              输出结果保存到 outputs/（密度图 .npy；点标注 .txt 或 .mat；头部框 .txt），可视化结果保存到 pngs/（.png）。
+            </p>
+          </div>
           <div class="actions">
             <button class="btn primary" id="btnRunTest" data-i18n="test.run">开始测试</button>
             <button class="btn danger" id="btnStopTest" disabled data-i18n="test.stop">停止测试</button>
@@ -576,6 +598,7 @@
           <div class="status-line" id="testStatus" data-i18n="test.notStarted">尚未开始测试</div>
           <div class="progress"><div class="progress-bar" id="testProgress"></div></div>
           <div class="metrics" id="testMetrics"></div>
+          <div class="saved-url" id="testSaveInfo"></div>
           <pre class="log" id="testLog"></pre>
         </div>
       </div>
@@ -598,6 +621,7 @@
         </select>
       </div>
       <div class="task-desc" data-i18n="hw.desc">实时硬件状态：CPU / 内存 / GPU / 磁盘 / 网络</div>
+      <span class="hint" id="hwConnState" style="margin-left:auto"></span>
       <button class="btn small" id="btnHwRefreshNow" style="margin-top:0"
               data-i18n="hw.refreshNow">立即刷新</button>
     </div>
@@ -657,7 +681,7 @@
         </div>
         <div class="field inline" style="margin-top:10px">
           <input id="upConvertTxt" type="checkbox" checked>
-          <label for="upConvertTxt" data-i18n="upload.convertTxt">标注统一转换为 .txt（取消则保留原始 .mat / .txt 格式，目录与文件主名仍统一为 GT/&lt;图像主名&gt;）</label>
+          <label for="upConvertTxt" data-i18n="upload.convertTxt">转换为 .txt 格式保存点标注</label>
         </div>
         <div class="field inline" style="margin-top:10px">
           <input id="upMatToNpy" type="checkbox">
@@ -740,6 +764,48 @@
             <tr><td colspan="5" style="color:var(--text-dim)">—</td></tr>
           </tbody>
         </table>
+
+        <div style="margin-top:16px;padding-top:14px;border-top:1px dashed var(--border)">
+          <h4 style="margin:0 0 8px;color:var(--accent2)" data-i18n="upload.convCard">已上传数据集转换</h4>
+          <p class="hint" data-i18n="upload.convCardHint">
+            直接选择已上传数据集，点标注转换为 .txt 或 .npy 密度图后生成带 _txt / _npy 后缀的新数据集（原数据集保留），也可将 .npy 密度图保存为 .png 可视化。
+          </p>
+          <div class="field"><label data-i18n="upload.convCardDataset">数据集</label>
+            <select id="convDsSelect"><option value="">— 选择已上传数据集 —</option></select></div>
+          <div class="grid2">
+            <div class="field inline">
+              <input id="convToNpy" type="checkbox">
+              <label for="convToNpy" data-i18n="upload.convToNpy">点标注 → 密度图 .npy（生成 _npy 数据集）</label>
+            </div>
+            <div class="field inline">
+              <input id="convToTxt" type="checkbox">
+              <label for="convToTxt" data-i18n="upload.convToTxt">转换为 .txt 格式保存点标注（生成 _txt 数据集）</label>
+            </div>
+            <div class="field inline">
+              <input id="convToPng" type="checkbox">
+              <label for="convToPng" data-i18n="upload.convToPng">.npy 密度图 → .png 可视化</label>
+            </div>
+          </div>
+          <div class="grid2" id="convNpyParams" style="display:none">
+            <div class="field"><label data-i18n="upload.npySigma">高斯 sigma（密度图生成，默认 2）</label>
+              <input id="convSigma" type="number" value="2" min="0.5" step="0.5"></div>
+            <div class="field inline" style="align-self:end">
+              <input id="convAdaptive" type="checkbox">
+              <label for="convAdaptive" data-i18n="mat.adaptive">k 近邻自适应 sigma（MCNN 风格）</label>
+            </div>
+          </div>
+          <div class="field" id="convVisDirField" style="display:none">
+            <label data-i18n="upload.visDir">PNG 保存目录（留空 → &lt;数据集&gt;/vis_png/Train|Test）</label>
+            <input id="convVisDir" type="text" placeholder="D:\datasets\SHHA_png" autocomplete="off">
+          </div>
+          <div class="actions">
+            <button class="btn" id="btnConvDataset" data-i18n="upload.convBtn">开始转换</button>
+          </div>
+          <div class="status-line" id="convStatus"></div>
+          <div class="progress" id="convProgressWrap" style="display:none">
+            <div class="progress-bar" id="convProgressBar"></div>
+          </div>
+        </div>
       </div>
 
       <div class="card wide" id="dsStructureCard">

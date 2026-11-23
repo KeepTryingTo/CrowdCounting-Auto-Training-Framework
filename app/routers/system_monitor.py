@@ -5,11 +5,13 @@ psutil / pynvml / torch 均为可选依赖，缺哪个降级哪个；
 网络速率由前端按相邻两次轮询的字节差计算
 """
 import platform
+import threading
 import time
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 # torch 可选（系统监控不绑定训练框架）
 try:
@@ -55,44 +57,65 @@ except Exception:
 
 
 def _collect_gpus():
-    """GPU 状态列表（显存设备级；利用率/温度需 NVML）"""
+    """GPU 状态列表（显存设备级；利用率/温度需 NVML）。
+
+    优先只走 NVML（线程安全）：本函数由后台采样线程每秒调用，若在这里
+    调 torch.cuda.mem_get_info / get_device_name，会与训练线程并发访问
+    CUDA 运行时/分配器，Windows 上可能直接 access violation 带走进程。
+    torch 仅在无 NVML 时兜底。
+    """
     gpus = []
-    if not _torch_ok():
-        return gpus
-    try:
-        count = _torch_device_count()
-    except Exception:
-        return gpus
+    count = 0
+    if _NVML_OK:
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+        except Exception:
+            count = 0
+    if not count:
+        # 无 NVML（未装 pynvml / 驱动不支持）：退回 torch
+        if not _torch_ok():
+            return gpus
+        try:
+            count = _torch_device_count()
+        except Exception:
+            return gpus
     for i in range(count):
-        info = {"index": i, "name": _torch_device_name(i),
+        info = {"index": i, "name": f"GPU {i}",
                 "memory_total_mb": None, "memory_used_mb": None,
                 "memory_percent": None, "utilization": None,
                 "temperature": None}
-        # 设备级显存（free/total 对整块卡而言，非本进程）
-        try:
-            if hasattr(torch.cuda, "mem_get_info"):
-                free, total = _torch_mem_info(i)
-            else:  # 旧版 torch 回退：NVML
-                raise RuntimeError
-            info["memory_total_mb"] = round(total / 1048576)
-            info["memory_used_mb"] = round((total - free) / 1048576)
-            if total:
-                info["memory_percent"] = round((total - free) / total * 100, 1)
-        except Exception:
-            pass
         if _NVML_OK:
             try:
                 h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                name = pynvml.nvmlDeviceGetName(h)
+                if isinstance(name, bytes):
+                    name = name.decode("utf-8", "ignore")
+                info["name"] = name
                 info["utilization"] = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
                 info["temperature"] = pynvml.nvmlDeviceGetTemperature(
                     h, pynvml.NVML_TEMPERATURE_GPU)
-                if info["memory_total_mb"] is None:
-                    mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-                    info["memory_total_mb"] = round(mem.total / 1048576)
-                    info["memory_used_mb"] = round(mem.used / 1048576)
-                    if mem.total:
-                        info["memory_percent"] = round(
-                            mem.used / mem.total * 100, 1)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                info["memory_total_mb"] = round(mem.total / 1048576)
+                info["memory_used_mb"] = round(mem.used / 1048576)
+                if mem.total:
+                    info["memory_percent"] = round(
+                        mem.used / mem.total * 100, 1)
+            except Exception:
+                pass
+        # 仅 NVML 拿不到时用 torch 兜底（无 NVML 的机器上才会走到）
+        if info["name"] == f"GPU {i}":
+            try:
+                info["name"] = _torch_device_name(i)
+            except Exception:
+                pass
+        if info["memory_total_mb"] is None:
+            try:
+                free, total = _torch_mem_info(i)
+                info["memory_total_mb"] = round(total / 1048576)
+                info["memory_used_mb"] = round((total - free) / 1048576)
+                if total:
+                    info["memory_percent"] = round(
+                        (total - free) / total * 100, 1)
             except Exception:
                 pass
         gpus.append(info)
@@ -116,9 +139,8 @@ def clear_backend_logs():
     return {"ok": True}
 
 
-@router.get("/hardware")
-def hardware_status():
-    """实时硬件状态（前端 1-5 秒轮询；网络速率由前端按字节差计算）"""
+def _collect_hardware_status():
+    """采集一次硬件状态（psutil/torch/NVML；可能被慢磁盘阻塞）。"""
     now = time.time()
     out = {"timestamp": now, "psutil_available": psutil is not None}
 
@@ -198,6 +220,52 @@ def hardware_status():
 
     out["gpus"] = _collect_gpus()
     return out
+
+
+# 硬件状态快照：后台线程每秒采样一次，接口只返回缓存。
+# 训练期间磁盘/CPU 繁忙时，psutil 调用可能变慢；若在请求线程里现采，
+# 轮询请求会堆积并拖垮事件循环，浏览器表现为 "Failed to fetch"。
+_hw_lock = threading.Lock()
+_hw_snapshot = None
+_hw_thread = None
+_hw_interval = 1.0
+
+
+def _hw_sampler_loop():
+    global _hw_snapshot
+    while True:
+        try:
+            data = _collect_hardware_status()
+        except Exception as exc:
+            data = {"timestamp": time.time(), "error": str(exc)}
+        with _hw_lock:
+            _hw_snapshot = data
+        time.sleep(_hw_interval)
+
+
+def _ensure_hw_sampler():
+    global _hw_thread
+    with _hw_lock:
+        if _hw_thread is not None and _hw_thread.is_alive():
+            return
+        _hw_thread = threading.Thread(target=_hw_sampler_loop,
+                                      name="hw-sampler", daemon=True)
+        _hw_thread.start()
+
+
+@router.get("/hardware")
+async def hardware_status():
+    """实时硬件状态（读取后台采样快照，避免阻塞训练期间的事件循环）。"""
+    global _hw_snapshot
+    _ensure_hw_sampler()
+    with _hw_lock:
+        snap = _hw_snapshot
+    if snap is None:
+        # 首次访问：交给线程池采集，避免阻塞事件循环
+        snap = await run_in_threadpool(_collect_hardware_status)
+        with _hw_lock:
+            _hw_snapshot = snap
+    return snap
 
 
 # ------------------------- 网络代理（预训练模型下载） -------------------------
